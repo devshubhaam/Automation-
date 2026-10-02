@@ -3,29 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
-
+from uuid import uuid4
 
 logger = logging.getLogger("app.job_manager")
 
 
-class JobStatus(str, Enum):
+class JobStatus:
     RECEIVED = "RECEIVED"
     QUEUED = "QUEUED"
     DOWNLOADING = "DOWNLOADING"
     EXTRACTING = "EXTRACTING"
     SCANNING = "SCANNING"
     UPLOADING = "UPLOADING"
-
     COMPLETED = "COMPLETED"
     COMPLETED_WITH_ERRORS = "COMPLETED_WITH_ERRORS"
-
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
@@ -38,8 +36,7 @@ TERMINAL_STATES = {
 }
 
 
-# Allowed state transitions.
-ALLOWED_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     JobStatus.RECEIVED: {
         JobStatus.QUEUED,
         JobStatus.CANCELLED,
@@ -82,77 +79,48 @@ ALLOWED_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
 
 @dataclass
 class UploadResult:
-    """Result returned by an uploader."""
+    """Successful upload/result information."""
 
-    provider: str
     media_type: str
     filename: str
-    path: str
+    provider: str
     url: str
     display_url: Optional[str] = None
     provider_id: Optional[str] = None
     size_bytes: Optional[int] = None
     width: Optional[int] = None
     height: Optional[int] = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "UploadResult":
-        return cls(
-            provider=str(data.get("provider", "")),
-            media_type=str(data.get("media_type", "")),
-            filename=str(data.get("filename", "")),
-            path=str(data.get("path", "")),
-            url=str(data.get("url", "")),
-            display_url=data.get("display_url"),
-            provider_id=data.get("provider_id"),
-            size_bytes=data.get("size_bytes"),
-            width=data.get("width"),
-            height=data.get("height"),
-            metadata=dict(data.get("metadata") or {}),
-        )
 
 
 @dataclass
 class UploadFailure:
-    """A failed upload attempt."""
+    """Information about an upload that failed."""
 
-    provider: str
     media_type: str
     filename: str
-    path: str
+    provider: str
     error: str
+    attempts: Optional[int] = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "UploadFailure":
-        return cls(
-            provider=str(data.get("provider", "")),
-            media_type=str(data.get("media_type", "")),
-            filename=str(data.get("filename", "")),
-            path=str(data.get("path", "")),
-            error=str(data.get("error", "")),
-        )
-
 
 @dataclass
 class Job:
-    """Represents one archive-processing job."""
+    """A single media-processing job."""
 
     job_id: str
     user_id: int
     chat_id: int
-
     archive_name: str
-    archive_path: Optional[str] = None
-    extract_dir: Optional[str] = None
 
-    status: JobStatus = JobStatus.RECEIVED
+    status: str = JobStatus.RECEIVED
 
     created_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
@@ -161,94 +129,212 @@ class Job:
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
-    message_id: Optional[int] = None
+    source_message_id: Optional[int] = None
     status_message_id: Optional[int] = None
+    sender_id: Optional[int] = None
+    message_id: Optional[int] = None
 
-    error: Optional[str] = None
+    archive_size_bytes: Optional[int] = None
+
+    archive_path: Optional[str] = None
+    extract_dir: Optional[str] = None
 
     image_count: int = 0
     video_count: int = 0
     ignored_count: int = 0
 
-    extracted_files: int = 0
-    extracted_bytes: int = 0
+    extracted_file_count: int = 0
+    extracted_size_bytes: int = 0
+
+    error: Optional[str] = None
 
     upload_results: list[UploadResult] = field(default_factory=list)
     upload_failures: list[UploadFailure] = field(default_factory=list)
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    # Runtime-only fields.
+    _telegram_message: Any = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    cancel_requested: bool = False
+
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc)
 
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_STATES
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert job to a JSON-safe dictionary."""
+
+        def serialize(value: Any) -> Any:
+            if isinstance(value, datetime):
+                return value.isoformat()
+
+            if isinstance(value, Path):
+                return str(value)
+
+            if isinstance(value, UploadResult):
+                return value.to_dict()
+
+            if isinstance(value, UploadFailure):
+                return value.to_dict()
+
+            if isinstance(value, dict):
+                return {
+                    str(k): serialize(v)
+                    for k, v in value.items()
+                }
+
+            if isinstance(value, (list, tuple)):
+                return [serialize(v) for v in value]
+
+            if hasattr(value, "to_dict"):
+                return serialize(value.to_dict())
+
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+
+            return str(value)
+
+        data = {
+            "job_id": self.job_id,
+            "user_id": self.user_id,
+            "chat_id": self.chat_id,
+            "archive_name": self.archive_name,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "source_message_id": self.source_message_id,
+            "status_message_id": self.status_message_id,
+            "sender_id": self.sender_id,
+            "message_id": self.message_id,
+            "archive_size_bytes": self.archive_size_bytes,
+            "archive_path": self.archive_path,
+            "extract_dir": self.extract_dir,
+            "image_count": self.image_count,
+            "video_count": self.video_count,
+            "ignored_count": self.ignored_count,
+            "extracted_file_count": self.extracted_file_count,
+            "extracted_size_bytes": self.extracted_size_bytes,
+            "error": self.error,
+            "upload_results": self.upload_results,
+            "upload_failures": self.upload_failures,
+            "metadata": self.metadata,
+            "cancel_requested": self.cancel_requested,
+        }
+
+        return serialize(data)
+
 
 class JobManager:
-    """Thread/task-safe in-memory job manager."""
+    """Manage job state, persistence metadata and queue bookkeeping."""
 
-    def __init__(
-        self,
-        job_root: Path,
-        max_jobs: int = 100,
-    ) -> None:
-        self.job_root = Path(job_root)
-        self.job_root.mkdir(parents=True, exist_ok=True)
-
-        self.max_jobs = max_jobs
+    def __init__(self, job_dir: str | Path) -> None:
+        self.job_dir = Path(job_dir)
+        self.job_dir.mkdir(parents=True, exist_ok=True)
 
         self._jobs: dict[str, Job] = {}
+
+        # This queue is bookkeeping for jobs waiting to enter the pipeline.
         self._queue: asyncio.Queue[str] = asyncio.Queue()
 
-        self._lock = asyncio.Lock()
+        # Prevent duplicate queue entries.
+        self._queued_ids: set[str] = set()
 
     # ------------------------------------------------------------------
-    # Job creation / lookup
+    # Job ID
     # ------------------------------------------------------------------
 
-    async def create_job(
+    @staticmethod
+    def generate_job_id() -> str:
+        """
+        Generate IDs similar to:
+
+        JOB-20261002-170612-4681
+        """
+
+        now = datetime.now()
+
+        # First four digits of microseconds keep IDs compact.
+        suffix = f"{now.microsecond:06d}"[:4]
+
+        return (
+            f"JOB-{now:%Y%m%d-%H%M%S}-{suffix}"
+        )
+
+    # ------------------------------------------------------------------
+    # Creation / retrieval
+    # ------------------------------------------------------------------
+
+    def create_job(
         self,
-        job_id: str,
-        user_id: int,
-        chat_id: int,
-        archive_name: str,
+        job_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        chat_id: int = 0,
+        archive_name: str = "archive.zip",
         message_id: Optional[int] = None,
+        source_message_id: Optional[int] = None,
+        sender_id: Optional[int] = None,
+        archive_size_bytes: Optional[int] = None,
     ) -> Job:
-        async with self._lock:
-            if len(self._jobs) >= self.max_jobs:
-                raise RuntimeError(
-                    "Maximum number of active jobs has been reached"
-                )
+        """
+        Create a new job.
 
-            if job_id in self._jobs:
-                raise ValueError(f"Job already exists: {job_id}")
+        The arguments intentionally support both the current API and
+        older Part-1 calling conventions.
+        """
 
-            job_dir = self.job_root / job_id
-            archive_dir = job_dir / "archive"
-            extracted_dir = job_dir / "extracted"
+        if job_id is None:
+            job_id = self.generate_job_id()
 
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            extracted_dir.mkdir(parents=True, exist_ok=True)
+        if user_id is None:
+            user_id = sender_id
 
-            job = Job(
-                job_id=job_id,
-                user_id=user_id,
-                chat_id=chat_id,
-                archive_name=archive_name,
-                archive_path=str(
-                    archive_dir / archive_name
-                ),
-                extract_dir=str(extracted_dir),
-                message_id=message_id,
-            )
+        if user_id is None:
+            raise ValueError("user_id/sender_id is required")
 
-            self._jobs[job_id] = job
+        if source_message_id is None:
+            source_message_id = message_id
 
-            logger.info(
-                "Created job %s (archive=%s)",
-                job.job_id,
-                job.archive_name,
-            )
+        if sender_id is None:
+            sender_id = user_id
 
-            return job
+        job_root = self.job_dir / job_id
+        archive_dir = job_root / "archive"
+        extract_dir = job_root / "extracted"
+
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        archive_path = archive_dir / archive_name
+
+        job = Job(
+            job_id=job_id,
+            user_id=int(user_id),
+            chat_id=int(chat_id),
+            archive_name=archive_name,
+            source_message_id=source_message_id,
+            message_id=message_id,
+            sender_id=sender_id,
+            archive_size_bytes=archive_size_bytes,
+            archive_path=str(archive_path),
+            extract_dir=str(extract_dir),
+        )
+
+        self._jobs[job_id] = job
+
+        logger.info(
+            "Created job %s (archive=%s)",
+            job.job_id,
+            job.archive_name,
+        )
+
+        return job
 
     def get_job(self, job_id: str) -> Optional[Job]:
         return self._jobs.get(job_id)
@@ -257,12 +343,19 @@ class JobManager:
         job = self.get_job(job_id)
 
         if job is None:
-            raise KeyError(f"Unknown job: {job_id}")
+            raise KeyError(f"Job not found: {job_id}")
 
         return job
 
     def list_jobs(self) -> list[Job]:
-        return list(self._jobs.values())
+        return sorted(
+            self._jobs.values(),
+            key=lambda job: job.created_at,
+        )
+
+    # Backward-compatible alias.
+    def all_jobs(self) -> list[Job]:
+        return self.list_jobs()
 
     # ------------------------------------------------------------------
     # Queue
@@ -271,35 +364,52 @@ class JobManager:
     async def enqueue(self, job_id: str) -> None:
         job = self.require_job(job_id)
 
+        if job.is_terminal():
+            return
+
+        if job_id in self._queued_ids:
+            return
+
+        self._queued_ids.add(job_id)
+
         if job.status == JobStatus.RECEIVED:
             self.set_status(job_id, JobStatus.QUEUED)
 
         await self._queue.put(job_id)
 
-    async def get_next_job(self) -> str:
-        return await self._queue.get()
+    async def get_next_job(self) -> Job:
+        job_id = await self._queue.get()
 
-    def task_done(self) -> None:
+        self._queued_ids.discard(job_id)
+
+        return self.require_job(job_id)
+
+    def task_done(self, job_id: Optional[str] = None) -> None:
+        """
+        Mark a queue item as processed.
+
+        job_id is accepted for compatibility, but asyncio.Queue itself
+        tracks completion independently of the ID.
+        """
+
         self._queue.task_done()
+
+        if job_id:
+            self._queued_ids.discard(job_id)
 
     def queue_size(self) -> int:
         return self._queue.qsize()
 
     def remove_from_queue(self, job_id: str) -> None:
         """
-        Remove a job from the bookkeeping queue.
+        Remove bookkeeping for a job.
 
-        The actual asyncio.Queue cannot safely remove arbitrary items,
-        so this method is intentionally a no-op for queue storage.
-
-        It exists as an explicit lifecycle hook so callers can mark
-        that processing has taken ownership of the job and prevent
-        stale queue bookkeeping in higher-level logic.
+        asyncio.Queue does not safely support arbitrary removal, so the
+        actual queue item is allowed to drain while this bookkeeping
+        prevents duplicate scheduling.
         """
-        logger.debug(
-            "Queue ownership transferred for job %s",
-            job_id,
-        )
+
+        self._queued_ids.discard(job_id)
 
     # ------------------------------------------------------------------
     # Status
@@ -308,12 +418,11 @@ class JobManager:
     def set_status(
         self,
         job_id: str,
-        new_status: JobStatus,
+        new_status: str,
+        *,
+        force: bool = False,
     ) -> Job:
         job = self.require_job(job_id)
-
-        if isinstance(new_status, str):
-            new_status = JobStatus(new_status)
 
         old_status = job.status
 
@@ -321,19 +430,20 @@ class JobManager:
             job.touch()
             return job
 
-        if old_status in TERMINAL_STATES:
+        if job.is_terminal() and not force:
             raise RuntimeError(
                 f"Cannot change terminal job {job_id}: "
-                f"{old_status.value} -> {new_status.value}"
+                f"{old_status} -> {new_status}"
             )
 
-        allowed = ALLOWED_TRANSITIONS.get(old_status, set())
+        if not force:
+            allowed = ALLOWED_TRANSITIONS.get(old_status, set())
 
-        if new_status not in allowed:
-            raise RuntimeError(
-                f"Invalid job status transition for {job_id}: "
-                f"{old_status.value} -> {new_status.value}"
-            )
+            if new_status not in allowed:
+                raise RuntimeError(
+                    f"Invalid job transition for {job_id}: "
+                    f"{old_status} -> {new_status}"
+                )
 
         job.status = new_status
         job.touch()
@@ -341,19 +451,11 @@ class JobManager:
         logger.info(
             "Job %s status %s -> %s",
             job_id,
-            old_status.value,
-            new_status.value,
+            old_status,
+            new_status,
         )
 
         return job
-
-    def is_terminal(self, job_id: str) -> bool:
-        job = self.require_job(job_id)
-        return job.status in TERMINAL_STATES
-
-    # ------------------------------------------------------------------
-    # Status message
-    # ------------------------------------------------------------------
 
     def set_status_message(
         self,
@@ -361,12 +463,14 @@ class JobManager:
         message_id: int,
     ) -> Job:
         job = self.require_job(job_id)
-        job.status_message_id = message_id
+
+        job.status_message_id = int(message_id)
         job.touch()
+
         return job
 
     # ------------------------------------------------------------------
-    # Errors
+    # Error / cancellation
     # ------------------------------------------------------------------
 
     def set_error(
@@ -374,15 +478,18 @@ class JobManager:
         job_id: str,
         error: str,
         *,
-        failed: bool = True,
+        failed: bool = False,
     ) -> Job:
         job = self.require_job(job_id)
 
         job.error = str(error)
         job.touch()
 
-        if failed and job.status not in TERMINAL_STATES:
-            self.set_status(job_id, JobStatus.FAILED)
+        if failed and not job.is_terminal():
+            self.set_status(
+                job_id,
+                JobStatus.FAILED,
+            )
 
         logger.error(
             "Job %s error: %s",
@@ -392,23 +499,62 @@ class JobManager:
 
         return job
 
+    def fail(
+        self,
+        job_id: str,
+        error: str,
+    ) -> Job:
+        return self.set_error(
+            job_id,
+            error,
+            failed=True,
+        )
+
+    def cancel(self, job_id: str) -> Job:
+        job = self.require_job(job_id)
+
+        job.cancel_requested = True
+        job.touch()
+
+        if not job.is_terminal():
+            self.set_status(
+                job_id,
+                JobStatus.CANCELLED,
+            )
+
+        self.remove_from_queue(job_id)
+
+        logger.info(
+            "Job %s cancelled",
+            job_id,
+        )
+
+        return job
+
+    # Backward-compatible alias.
+    def request_cancel(self, job_id: str) -> Job:
+        return self.cancel(job_id)
+
+    def is_cancel_requested(self, job_id: str) -> bool:
+        return self.require_job(job_id).cancel_requested
+
     # ------------------------------------------------------------------
-    # Media statistics
+    # Media / extraction stats
     # ------------------------------------------------------------------
 
     def set_media_counts(
         self,
         job_id: str,
         *,
-        images: int,
-        videos: int,
-        ignored: int,
+        image_count: int = 0,
+        video_count: int = 0,
+        ignored_count: int = 0,
     ) -> Job:
         job = self.require_job(job_id)
 
-        job.image_count = int(images)
-        job.video_count = int(videos)
-        job.ignored_count = int(ignored)
+        job.image_count = int(image_count)
+        job.video_count = int(video_count)
+        job.ignored_count = int(ignored_count)
         job.touch()
 
         return job
@@ -417,75 +563,13 @@ class JobManager:
         self,
         job_id: str,
         *,
-        files: int,
-        bytes_total: int,
+        file_count: int = 0,
+        total_size_bytes: int = 0,
     ) -> Job:
         job = self.require_job(job_id)
 
-        job.extracted_files = int(files)
-        job.extracted_bytes = int(bytes_total)
-        job.touch()
-
-        return job
-
-    # ------------------------------------------------------------------
-    # Upload results
-    # ------------------------------------------------------------------
-
-    def add_upload_result(
-        self,
-        job_id: str,
-        result: UploadResult | dict[str, Any],
-    ) -> Job:
-        job = self.require_job(job_id)
-
-        if isinstance(result, dict):
-            result = UploadResult.from_dict(result)
-
-        job.upload_results.append(result)
-        job.touch()
-
-        logger.info(
-            "Job %s upload successful: provider=%s "
-            "media_type=%s filename=%s",
-            job_id,
-            result.provider,
-            result.media_type,
-            result.filename,
-        )
-
-        return job
-
-    def add_upload_failure(
-        self,
-        job_id: str,
-        failure: UploadFailure | dict[str, Any],
-    ) -> Job:
-        job = self.require_job(job_id)
-
-        if isinstance(failure, dict):
-            failure = UploadFailure.from_dict(failure)
-
-        job.upload_failures.append(failure)
-        job.touch()
-
-        logger.warning(
-            "Job %s upload failed: provider=%s "
-            "media_type=%s filename=%s error=%s",
-            job_id,
-            failure.provider,
-            failure.media_type,
-            failure.filename,
-            failure.error,
-        )
-
-        return job
-
-    def clear_upload_results(self, job_id: str) -> Job:
-        job = self.require_job(job_id)
-
-        job.upload_results.clear()
-        job.upload_failures.clear()
+        job.extracted_file_count = int(file_count)
+        job.extracted_size_bytes = int(total_size_bytes)
         job.touch()
 
         return job
@@ -520,27 +604,117 @@ class JobManager:
         return job
 
     # ------------------------------------------------------------------
-    # Completion
+    # Upload results
     # ------------------------------------------------------------------
 
-    def complete(
+    def add_upload_result(
         self,
         job_id: str,
+        result: UploadResult | dict[str, Any],
     ) -> Job:
         job = self.require_job(job_id)
 
-        if job.upload_failures:
-            return self.complete_with_errors(job_id)
+        if isinstance(result, dict):
+            result = UploadResult(
+                media_type=str(
+                    result.get("media_type", "unknown")
+                ),
+                filename=str(
+                    result.get("filename", "")
+                ),
+                provider=str(
+                    result.get("provider", "")
+                ),
+                url=str(
+                    result.get("url", "")
+                ),
+                display_url=result.get("display_url"),
+                provider_id=result.get("provider_id")
+                or result.get("id"),
+                size_bytes=result.get("size_bytes")
+                or result.get("size"),
+                width=result.get("width"),
+                height=result.get("height"),
+                extra=result.get("extra", {}),
+            )
 
-        self.set_status(job_id, JobStatus.COMPLETED)
+        job.upload_results.append(result)
+        job.touch()
 
         return job
 
-    def complete_with_errors(
+    def set_upload_result(
         self,
         job_id: str,
+        result: UploadResult | dict[str, Any],
+    ) -> Job:
+        return self.add_upload_result(
+            job_id,
+            result,
+        )
+
+    def add_upload_failure(
+        self,
+        job_id: str,
+        failure: UploadFailure | dict[str, Any],
     ) -> Job:
         job = self.require_job(job_id)
+
+        if isinstance(failure, dict):
+            failure = UploadFailure(
+                media_type=str(
+                    failure.get("media_type", "unknown")
+                ),
+                filename=str(
+                    failure.get("filename", "")
+                ),
+                provider=str(
+                    failure.get("provider", "")
+                ),
+                error=str(
+                    failure.get("error", "Unknown error")
+                ),
+                attempts=failure.get("attempts"),
+                extra=failure.get("extra", {}),
+            )
+
+        job.upload_failures.append(failure)
+        job.touch()
+
+        return job
+
+    def set_upload_failure(
+        self,
+        job_id: str,
+        failure: UploadFailure | dict[str, Any],
+    ) -> Job:
+        return self.add_upload_failure(
+            job_id,
+            failure,
+        )
+
+    # ------------------------------------------------------------------
+    # Completion
+    # ------------------------------------------------------------------
+
+    def complete(self, job_id: str) -> Job:
+        job = self.require_job(job_id)
+
+        if job.is_terminal():
+            return job
+
+        self.set_status(
+            job_id,
+            JobStatus.COMPLETED,
+        )
+
+        return job
+
+    def complete_with_errors(self, job_id: str) -> Job:
+        job = self.require_job(job_id)
+
+        if job.is_terminal():
+            return job
 
         self.set_status(
             job_id,
@@ -549,124 +723,66 @@ class JobManager:
 
         return job
 
-    def cancel(
-        self,
-        job_id: str,
-        reason: Optional[str] = None,
-    ) -> Job:
-        job = self.require_job(job_id)
-
-        if job.status in TERMINAL_STATES:
-            return job
-
-        if reason:
-            job.error = reason
-
-        self.set_status(
-            job_id,
-            JobStatus.CANCELLED,
-        )
-
-        return job
-
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
 
-    def serialize_job(
-        self,
-        job_id: str,
-    ) -> dict[str, Any]:
+    def save_job_json(self, job_id: str) -> Path:
+        """
+        Save a JSON snapshot inside the job directory.
+
+        This is only metadata persistence; Telegram session persistence
+        remains handled separately by MongoDB.
+        """
+
         job = self.require_job(job_id)
 
-        data = asdict(job)
+        job_root = self.job_dir / job.job_id
+        job_root.mkdir(parents=True, exist_ok=True)
 
-        data["status"] = job.status.value
+        path = job_root / "job.json"
 
-        data["created_at"] = job.created_at.isoformat()
-        data["updated_at"] = job.updated_at.isoformat()
-
-        data["upload_results"] = [
-            result.to_dict()
-            for result in job.upload_results
-        ]
-
-        data["upload_failures"] = [
-            failure.to_dict()
-            for failure in job.upload_failures
-        ]
-
-        return data
-
-    def deserialize_job(
-        self,
-        data: dict[str, Any],
-    ) -> Job:
-        created_at = data.get("created_at")
-        updated_at = data.get("updated_at")
-
-        if isinstance(created_at, str):
-            created_at = datetime.fromisoformat(created_at)
-
-        if isinstance(updated_at, str):
-            updated_at = datetime.fromisoformat(updated_at)
-
-        job = Job(
-            job_id=str(data["job_id"]),
-            user_id=int(data["user_id"]),
-            chat_id=int(data["chat_id"]),
-            archive_name=str(data["archive_name"]),
-            archive_path=data.get("archive_path"),
-            extract_dir=data.get("extract_dir"),
-            status=JobStatus(data.get("status", JobStatus.RECEIVED.value)),
-            created_at=created_at
-            or datetime.now(timezone.utc),
-            updated_at=updated_at
-            or datetime.now(timezone.utc),
-            message_id=data.get("message_id"),
-            status_message_id=data.get("status_message_id"),
-            error=data.get("error"),
-            image_count=int(data.get("image_count", 0)),
-            video_count=int(data.get("video_count", 0)),
-            ignored_count=int(data.get("ignored_count", 0)),
-            extracted_files=int(data.get("extracted_files", 0)),
-            extracted_bytes=int(data.get("extracted_bytes", 0)),
-            upload_results=[
-                UploadResult.from_dict(item)
-                for item in data.get("upload_results", [])
-            ],
-            upload_failures=[
-                UploadFailure.from_dict(item)
-                for item in data.get("upload_failures", [])
-            ],
-            metadata=dict(data.get("metadata") or {}),
+        path.write_text(
+            json.dumps(
+                job.to_dict(),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
 
-        return job
+        return path
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
-    def cleanup_job_files(
-        self,
-        job_id: str,
-    ) -> None:
-        job = self.get_job(job_id)
+    def cleanup_job_files(self, job_id: str) -> None:
+        job = self.require_job(job_id)
 
-        if job is None:
+        job_root = self.job_dir / job.job_id
+
+        if not job_root.exists():
             return
 
-        job_dir = self.job_root / job_id
+        # Safety check: never delete outside configured job_dir.
+        try:
+            resolved_root = job_root.resolve()
+            resolved_base = self.job_dir.resolve()
 
-        if not job_dir.exists():
+            resolved_root.relative_to(resolved_base)
+        except ValueError:
+            logger.error(
+                "Refusing to cleanup unsafe job path: %s",
+                job_root,
+            )
             return
 
         try:
-            shutil.rmtree(job_dir)
+            shutil.rmtree(resolved_root)
 
             logger.info(
-                "Cleaned job %s (removed: archive, extracted)",
+                "Cleaned job %s files",
                 job_id,
             )
 
@@ -675,76 +791,41 @@ class JobManager:
 
         except Exception:
             logger.exception(
-                "Failed to clean job files for %s",
+                "Failed to cleanup job %s",
                 job_id,
             )
 
-    def remove_job(
-        self,
-        job_id: str,
-        *,
-        cleanup_files: bool = True,
-    ) -> Optional[Job]:
+    def cleanup(self, job_id: str) -> None:
+        self.cleanup_job_files(job_id)
+
+    def remove_job(self, job_id: str) -> Optional[Job]:
         job = self._jobs.pop(job_id, None)
 
-        if job is None:
-            return None
-
-        if cleanup_files:
-            self.cleanup_job_files(job_id)
-
-        logger.debug(
-            "Removed job %s from job manager",
-            job_id,
-        )
+        self.remove_from_queue(job_id)
 
         return job
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Convenience helpers
     # ------------------------------------------------------------------
 
     def active_jobs(self) -> list[Job]:
         return [
             job
             for job in self._jobs.values()
-            if job.status not in TERMINAL_STATES
+            if not job.is_terminal()
         ]
 
-    def active_job_count(self) -> int:
-        return len(self.active_jobs())
-
-    def completed_job_count(self) -> int:
-        return sum(
-            1
-            for job in self._jobs.values()
-            if job.status in TERMINAL_STATES
-        )
-
-    def get_upload_urls(
-        self,
-        job_id: str,
-    ) -> list[str]:
-        job = self.require_job(job_id)
-
+    def completed_jobs(self) -> list[Job]:
         return [
-            result.url
-            for result in job.upload_results
-            if result.url
+            job
+            for job in self._jobs.values()
+            if job.status
+            in {
+                JobStatus.COMPLETED,
+                JobStatus.COMPLETED_WITH_ERRORS,
+            }
         ]
 
-    def get_upload_results(
-        self,
-        job_id: str,
-    ) -> list[UploadResult]:
-        job = self.require_job(job_id)
-
-        return list(job.upload_results)
-
-    def get_upload_failures(
-        self,
-        job_id: str,
-    ) -> list[UploadFailure]:
-        job = self.require_job(job_id)
-
-        return list(job.upload_failures)
+    def has_job(self, job_id: str) -> bool:
+        return job_id in self._jobs
