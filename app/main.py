@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 from typing import Optional
 
 from .archive_processor import safe_extract, validate_archive
 from .config import ConfigError, Settings
 from .job_manager import JobManager, JobStatus
+from .logging_config import setup_logging
 from .login_bot import LoginBot
 from .media_scanner import scan_directory
 from .telegram_client import TelegramUserbot
@@ -125,8 +125,15 @@ class PipelineWorker:
         job_id = job.job_id
 
         try:
-            # RECEIVED -> QUEUED is normally done by Telegram handler.
-            # QUEUED -> DOWNLOADING
+            # A queued job can be cancelled before its worker starts.
+            if job.cancel_requested:
+                logger.info(
+                    "Job %s was cancelled before processing started",
+                    job_id,
+                )
+                self.job_manager.cancel(job_id)
+                return
+
             self.job_manager.set_status(
                 job_id,
                 JobStatus.DOWNLOADING,
@@ -149,7 +156,6 @@ class PipelineWorker:
                 archive_path,
             )
 
-            # Validate before extraction.
             archive_info = await asyncio.to_thread(
                 validate_archive,
                 archive_path,
@@ -163,7 +169,6 @@ class PipelineWorker:
                 self.job_manager.cancel(job_id)
                 return
 
-            # DOWNLOADING -> EXTRACTING
             self.job_manager.set_status(
                 job_id,
                 JobStatus.EXTRACTING,
@@ -193,7 +198,6 @@ class PipelineWorker:
                 extraction_result.total_bytes,
             )
 
-            # EXTRACTING -> SCANNING
             self.job_manager.set_status(
                 job_id,
                 JobStatus.SCANNING,
@@ -218,7 +222,6 @@ class PipelineWorker:
                 result.counts(),
             )
 
-            # SCANNING -> COMPLETED
             self.job_manager.set_status(
                 job_id,
                 JobStatus.COMPLETED,
@@ -249,14 +252,18 @@ class PipelineWorker:
             try:
                 current = self.job_manager.get(job_id)
 
-                if not current.is_terminal:
+                if current.cancel_requested and not current.is_terminal:
+                    self.job_manager.cancel(job_id)
+
+                elif not current.is_terminal:
                     self.job_manager.fail(
                         job_id,
                         f"{type(exc).__name__}: {exc}",
                     )
+
             except Exception:
                 logger.exception(
-                    "Failed to mark job %s as failed",
+                    "Failed to update final state for job %s",
                     job_id,
                 )
 
@@ -271,16 +278,11 @@ class PipelineWorker:
 
     async def _download(self, job):
         """Download the Telegram document for the job."""
-        if self.settings.keep_job_files:
-            logger.info(
-                "KEEP_JOB_FILES=true for job %s",
-                job.job_id,
-            )
-
-        # The Telegram message itself is not stored in JobManager.
-        # telegram_client attaches the source message object to the job
-        # before submitting it.
-        message = getattr(job, "_telegram_message", None)
+        message = getattr(
+            job,
+            "_telegram_message",
+            None,
+        )
 
         if message is None:
             raise RuntimeError(
@@ -352,16 +354,13 @@ class Application:
             self.userbot,
         )
 
-        # Start userbot connection.
         await self.userbot.start()
 
-        # Existing authorized session.
         if await self.userbot.client.is_user_authorized():
             logger.info(
                 "Existing Telegram userbot session is authorized"
             )
 
-        # First-time QR login.
         else:
             if not self.settings.bot_token:
                 raise ConfigError(
@@ -391,7 +390,6 @@ class Application:
                 "QR authentication completed"
             )
 
-        # Start processing workers only after Telegram auth.
         await self.pipeline.start()
 
         logger.info(
@@ -435,6 +433,8 @@ async def async_main() -> None:
     """Async entry point."""
     settings = Settings.from_env()
 
+    setup_logging(settings)
+
     application = Application(settings)
 
     loop = asyncio.get_running_loop()
@@ -468,18 +468,18 @@ def main() -> None:
         asyncio.run(async_main())
 
     except KeyboardInterrupt:
-        logger.info(
+        logging.getLogger("app.main").info(
             "Application interrupted by user"
         )
 
     except ConfigError:
-        logger.exception(
+        logging.getLogger("app.main").exception(
             "Configuration error"
         )
         raise
 
     except Exception:
-        logger.exception(
+        logging.getLogger("app.main").exception(
             "Application terminated unexpectedly"
         )
         raise
