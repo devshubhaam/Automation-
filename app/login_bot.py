@@ -69,7 +69,11 @@ class LoginBot:
                 int(event.sender_id)
                 == int(self.settings.bot_owner_id)
             )
-        except (TypeError, ValueError):
+
+        except (
+            TypeError,
+            ValueError,
+        ):
             return False
 
     async def start(self) -> None:
@@ -82,10 +86,13 @@ class LoginBot:
 
         if self.settings.bot_owner_id is None:
             raise RuntimeError(
-                "BOT_OWNER_ID is required when BOT_TOKEN is configured"
+                "BOT_OWNER_ID is required when "
+                "BOT_TOKEN is configured"
             )
 
-        logger.info("Starting Telegram login bot")
+        logger.info(
+            "Starting Telegram login bot"
+        )
 
         await self.client.start(
             bot_token=self.settings.bot_token
@@ -98,7 +105,12 @@ class LoginBot:
 
         logger.info(
             "Login bot started as @%s",
-            getattr(me, "username", None) or "none",
+            getattr(
+                me,
+                "username",
+                None,
+            )
+            or "none",
         )
 
     async def stop(self) -> None:
@@ -108,7 +120,9 @@ class LoginBot:
 
         self._running = False
 
-        logger.info("Telegram login bot stopped")
+        logger.info(
+            "Telegram login bot stopped"
+        )
 
     def _register_handlers(self) -> None:
         """Register login-bot handlers exactly once."""
@@ -248,7 +262,7 @@ class LoginBot:
         self,
         event: events.NewMessage.Event,
     ) -> bool:
-        """Verify and finalize authenticated userbot."""
+        """Verify, finalize, and persist authenticated userbot."""
         client = self.userbot.client
 
         me = await client.get_me()
@@ -273,6 +287,7 @@ class LoginBot:
 
             try:
                 await client.log_out()
+
             except Exception:
                 logger.exception(
                     "Failed to log out unexpected QR account"
@@ -283,9 +298,43 @@ class LoginBot:
                 "Telegram account.\n\n"
                 "That session has been logged out."
             )
+
             return False
 
-        self.userbot.finish_authenticated_account(me)
+        # Finalize userbot first so owner information and
+        # message handlers are registered.
+        self.userbot.finish_authenticated_account(
+            me
+        )
+
+        # IMPORTANT:
+        # Save the authenticated Telegram session immediately.
+        # This prevents QR login from being required again
+        # after a Koyeb restart/redeploy.
+        if self.userbot.session_store is not None:
+            try:
+                await self.userbot.persist_session()
+
+                logger.info(
+                    "Telegram session saved to MongoDB "
+                    "after successful QR login"
+                )
+
+            except Exception:
+                logger.exception(
+                    "Telegram authentication succeeded, "
+                    "but MongoDB session persistence failed"
+                )
+
+                await event.reply(
+                    "⚠️ Telegram login successful, "
+                    "but session could not be saved to MongoDB.\n\n"
+                    "Do NOT redeploy/restart yet. "
+                    "Check MongoDB configuration first."
+                )
+
+                return False
+
         self._authorized_event.set()
 
         logger.info(
@@ -315,6 +364,8 @@ class LoginBot:
             if not client.is_connected():
                 await client.connect()
 
+            # If an existing MongoDB/local session is already
+            # authorized, no QR login is necessary.
             if await client.is_user_authorized():
                 await self._finish_login(event)
                 return
@@ -334,12 +385,14 @@ class LoginBot:
                 logger.warning(
                     "TELEGRAM_2FA_PASSWORD is not configured"
                 )
+
                 return
 
             await event.reply(
                 "🔐 QR login starting...\n\n"
                 "Telegram app me:\n"
-                "Settings → Devices → Link Desktop Device\n\n"
+                "Settings → Devices → "
+                "Link Desktop Device\n\n"
                 "Neeche aane wala QR scan karo."
             )
 
@@ -391,6 +444,7 @@ class LoginBot:
                             "Check `TELEGRAM_2FA_PASSWORD` "
                             "in Koyeb and try /login again."
                         )
+
                         return
 
                 break
