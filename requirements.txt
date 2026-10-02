@@ -1,0 +1,7 @@
+# PART 1 runtime dependencies (kept intentionally minimal)
+Telethon>=1.36.0,<2.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# Test / development
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
