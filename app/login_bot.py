@@ -31,14 +31,24 @@ class LoginBot:
         self.userbot = userbot
 
         self._client: Optional[TelegramClient] = None
+
         self._authorized_event = asyncio.Event()
+
+        # Prevent multiple /login commands from starting
+        # multiple QR login flows at the same time.
         self._login_lock = asyncio.Lock()
+
         self._running = False
         self._handlers_registered = False
+
+    # ------------------------------------------------------------------ #
+    # Login bot client
+    # ------------------------------------------------------------------ #
 
     @property
     def client(self) -> TelegramClient:
         """Return the Telegram login-bot client."""
+
         if self._client is None:
             self.settings.session_dir.mkdir(
                 parents=True,
@@ -46,7 +56,10 @@ class LoginBot:
             )
 
             self._client = TelegramClient(
-                str(self.settings.session_dir / "login_bot"),
+                str(
+                    self.settings.session_dir
+                    / "login_bot"
+                ),
                 self.settings.api_id,
                 self.settings.api_hash,
                 device_model="Media Processor Login Bot",
@@ -56,11 +69,16 @@ class LoginBot:
 
         return self._client
 
+    # ------------------------------------------------------------------ #
+    # Owner verification
+    # ------------------------------------------------------------------ #
+
     def is_owner(
         self,
         event: events.NewMessage.Event,
     ) -> bool:
         """Allow commands only from BOT_OWNER_ID."""
+
         if self.settings.bot_owner_id is None:
             return False
 
@@ -76,11 +94,17 @@ class LoginBot:
         ):
             return False
 
+    # ------------------------------------------------------------------ #
+    # Start / stop
+    # ------------------------------------------------------------------ #
+
     async def start(self) -> None:
-        """Start the login bot."""
+        """Start the owner-only login bot."""
+
         if not self.settings.bot_token:
             logger.info(
-                "BOT_TOKEN not configured; login bot disabled"
+                "BOT_TOKEN not configured; "
+                "login bot disabled"
             )
             return
 
@@ -99,6 +123,7 @@ class LoginBot:
         )
 
         self._register_handlers()
+
         self._running = True
 
         me = await self.client.get_me()
@@ -115,24 +140,38 @@ class LoginBot:
 
     async def stop(self) -> None:
         """Stop the login bot."""
-        if self._client is not None:
-            await self._client.disconnect()
 
         self._running = False
+
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+
+            except Exception:
+                logger.exception(
+                    "Failed to disconnect login bot"
+                )
 
         logger.info(
             "Telegram login bot stopped"
         )
 
+    # ------------------------------------------------------------------ #
+    # Event handlers
+    # ------------------------------------------------------------------ #
+
     def _register_handlers(self) -> None:
         """Register login-bot handlers exactly once."""
+
         if self._handlers_registered:
             return
 
         self._handlers_registered = True
 
         @self.client.on(
-            events.NewMessage(incoming=True)
+            events.NewMessage(
+                incoming=True
+            )
         )
         async def handler(
             event: events.NewMessage.Event,
@@ -148,14 +187,23 @@ class LoginBot:
         event: events.NewMessage.Event,
     ) -> None:
         """Handle commands sent to the login bot."""
+
         if not self.is_owner(event):
             return
 
         text = (
             event.raw_text or ""
-        ).strip().lower()
+        ).strip()
 
-        if text == "/start":
+        command = (
+            text.split(
+                maxsplit=1
+            )[0].lower()
+            if text
+            else ""
+        )
+
+        if command == "/start":
             await event.reply(
                 "🤖 Media Processor Login Bot\n\n"
                 "Use /login to authorize the userbot via QR.\n"
@@ -163,19 +211,24 @@ class LoginBot:
             )
             return
 
-        if text == "/status":
+        if command == "/status":
             await self._handle_status(event)
             return
 
-        if text == "/login":
+        if command == "/login":
             await self._run_qr_login(event)
             return
+
+    # ------------------------------------------------------------------ #
+    # Status
+    # ------------------------------------------------------------------ #
 
     async def _handle_status(
         self,
         event: events.NewMessage.Event,
     ) -> None:
         """Show current userbot authentication status."""
+
         try:
             client = self.userbot.client
 
@@ -214,11 +267,16 @@ class LoginBot:
                 "❌ Could not check login status."
             )
 
+    # ------------------------------------------------------------------ #
+    # QR login entry
+    # ------------------------------------------------------------------ #
+
     async def _run_qr_login(
         self,
         event: events.NewMessage.Event,
     ) -> None:
         """Run one QR login attempt at a time."""
+
         if self._login_lock.locked():
             await event.reply(
                 "⏳ A login attempt is already running.\n"
@@ -229,12 +287,17 @@ class LoginBot:
         async with self._login_lock:
             await self._perform_qr_login(event)
 
+    # ------------------------------------------------------------------ #
+    # QR image
+    # ------------------------------------------------------------------ #
+
     async def _send_qr(
         self,
         event: events.NewMessage.Event,
         qr_url: str,
     ) -> None:
-        """Generate and send QR image."""
+        """Generate and send a QR image."""
+
         qr = qrcode.make(qr_url)
 
         buffer = io.BytesIO()
@@ -245,24 +308,35 @@ class LoginBot:
         )
 
         buffer.seek(0)
-        buffer.name = "telegram_login_qr.png"
+
+        buffer.name = (
+            "telegram_login_qr.png"
+        )
 
         await self.client.send_file(
             event.chat_id,
             buffer,
             force_document=False,
             caption=(
-                "📱 Is QR ko scan karo.\n\n"
+                "📱 Scan this QR in Telegram.\n\n"
                 "Telegram → Settings → Devices → "
                 "Link Desktop Device"
             ),
         )
 
+    # ------------------------------------------------------------------ #
+    # Finalize authentication
+    # ------------------------------------------------------------------ #
+
     async def _finish_login(
         self,
         event: events.NewMessage.Event,
     ) -> bool:
-        """Verify, finalize, and persist authenticated userbot."""
+        """
+        Verify the logged-in account, register the userbot,
+        and persist the session to MongoDB.
+        """
+
         client = self.userbot.client
 
         me = await client.get_me()
@@ -274,14 +348,22 @@ class LoginBot:
             )
             return False
 
-        expected_owner = self.settings.bot_owner_id
+        # -------------------------------------------------------------- #
+        # Make sure the QR was scanned by our owner account.
+        # -------------------------------------------------------------- #
+
+        expected_owner = (
+            self.settings.bot_owner_id
+        )
 
         if (
             expected_owner is not None
-            and int(me.id) != int(expected_owner)
+            and int(me.id)
+            != int(expected_owner)
         ):
             logger.warning(
-                "QR login completed by unexpected account: %s",
+                "QR login completed by unexpected "
+                "Telegram account: %s",
                 me.id,
             )
 
@@ -290,7 +372,8 @@ class LoginBot:
 
             except Exception:
                 logger.exception(
-                    "Failed to log out unexpected QR account"
+                    "Failed to log out unexpected "
+                    "Telegram account"
                 )
 
             await event.reply(
@@ -301,22 +384,25 @@ class LoginBot:
 
             return False
 
-        # Finalize userbot first so owner information and
-        # message handlers are registered.
+        # -------------------------------------------------------------- #
+        # Tell the userbot that authentication succeeded.
+        # -------------------------------------------------------------- #
+
         self.userbot.finish_authenticated_account(
             me
         )
 
-        # IMPORTANT:
-        # Save the authenticated Telegram session immediately.
-        # This prevents QR login from being required again
-        # after a Koyeb restart/redeploy.
+        # -------------------------------------------------------------- #
+        # Persist session immediately.
+        # -------------------------------------------------------------- #
+
         if self.userbot.session_store is not None:
+
             try:
                 await self.userbot.persist_session()
 
                 logger.info(
-                    "Telegram session saved to MongoDB "
+                    "Telegram session persisted to MongoDB "
                     "after successful QR login"
                 )
 
@@ -328,19 +414,30 @@ class LoginBot:
 
                 await event.reply(
                     "⚠️ Telegram login successful, "
-                    "but session could not be saved to MongoDB.\n\n"
-                    "Do NOT redeploy/restart yet. "
-                    "Check MongoDB configuration first."
+                    "but the session could not be saved "
+                    "to MongoDB.\n\n"
+                    "Do NOT restart/redeploy yet. "
+                    "Check MongoDB configuration."
                 )
 
                 return False
+
+        # -------------------------------------------------------------- #
+        # Signal main.py that authentication is complete.
+        # -------------------------------------------------------------- #
 
         self._authorized_event.set()
 
         logger.info(
             "Userbot authenticated successfully "
-            "(owner_id=%s)",
+            "(owner_id=%s, username=%s)",
             me.id,
+            getattr(
+                me,
+                "username",
+                None,
+            )
+            or "none",
         )
 
         await event.reply(
@@ -348,42 +445,70 @@ class LoginBot:
             f"Account ID: {me.id}\n"
             f"Username: "
             f"@{getattr(me, 'username', None) or 'none'}\n\n"
-            "Userbot is now ready."
+            "Userbot is now ready.\n"
+            "Session saved securely."
         )
 
         return True
+
+    # ------------------------------------------------------------------ #
+    # QR authentication
+    # ------------------------------------------------------------------ #
 
     async def _perform_qr_login(
         self,
         event: events.NewMessage.Event,
     ) -> None:
-        """Perform QR authentication with 2FA support."""
+        """
+        Perform QR authentication.
+
+        IMPORTANT:
+        qr_login.wait() is started BEFORE the QR is sent to Telegram.
+        This prevents the QR from being scanned before Telethon starts
+        listening for the login-token update.
+        """
+
         client = self.userbot.client
 
         try:
             if not client.is_connected():
                 await client.connect()
 
-            # If an existing MongoDB/local session is already
-            # authorized, no QR login is necessary.
+            # ---------------------------------------------------------- #
+            # Existing authorized session?
+            # ---------------------------------------------------------- #
+
             if await client.is_user_authorized():
-                await self._finish_login(event)
+
+                logger.info(
+                    "Userbot is already authorized; "
+                    "QR login is not required"
+                )
+
+                await self._finish_login(
+                    event
+                )
+
                 return
+
+            # ---------------------------------------------------------- #
+            # 2FA password
+            # ---------------------------------------------------------- #
 
             password = os.getenv(
                 "TELEGRAM_2FA_PASSWORD"
             )
 
             if not password:
-                await event.reply(
-                    "🔒 Telegram 2FA password is required.\n\n"
-                    "Koyeb Environment Variables me "
-                    "`TELEGRAM_2FA_PASSWORD` add karo, "
-                    "phir /login dobara bhejo."
-                )
-
                 logger.warning(
                     "TELEGRAM_2FA_PASSWORD is not configured"
+                )
+
+                await event.reply(
+                    "🔒 Telegram 2FA password is required.\n\n"
+                    "Add `TELEGRAM_2FA_PASSWORD` "
+                    "to Koyeb Environment Variables, "
+                    "then use /login again."
                 )
 
                 return
@@ -393,39 +518,125 @@ class LoginBot:
                 "Telegram app me:\n"
                 "Settings → Devices → "
                 "Link Desktop Device\n\n"
-                "Neeche aane wala QR scan karo."
+                "A fresh QR will be sent."
+            )
+
+            # ---------------------------------------------------------- #
+            # Create QR login object.
+            # ---------------------------------------------------------- #
+
+            qr_login = await client.qr_login()
+
+            logger.info(
+                "Created Telegram QR login token"
             )
 
             while True:
-                qr_login = await client.qr_login()
 
-                await self._send_qr(
-                    event,
-                    qr_login.url,
-                )
+                # ------------------------------------------------------ #
+                # CRITICAL FIX:
+                #
+                # Start waiting BEFORE sending the QR.
+                #
+                # Telethon documentation explicitly requires wait()
+                # to be running while the QR is being scanned.
+                # ------------------------------------------------------ #
 
-                logger.info(
-                    "QR login code sent to owner"
+                wait_task = asyncio.create_task(
+                    qr_login.wait()
                 )
 
                 try:
-                    await qr_login.wait()
+                    # -------------------------------------------------- #
+                    # Now send the QR.
+                    # wait_task is already listening.
+                    # -------------------------------------------------- #
 
-                except asyncio.TimeoutError:
-                    logger.info(
-                        "QR expired; generating a new QR"
+                    await self._send_qr(
+                        event,
+                        qr_login.url,
                     )
 
+                    logger.info(
+                        "QR login code sent to owner"
+                    )
+
+                    # -------------------------------------------------- #
+                    # Wait for scan/login result.
+                    # -------------------------------------------------- #
+
+                    try:
+                        await wait_task
+
+                    except SessionPasswordNeededError:
+                        logger.info(
+                            "QR scan successful; "
+                            "Telegram requires 2FA password"
+                        )
+
+                        try:
+                            await client.sign_in(
+                                password=password
+                            )
+
+                        except Exception:
+                            logger.exception(
+                                "Telegram 2FA authentication failed"
+                            )
+
+                            await event.reply(
+                                "❌ Telegram 2FA authentication failed.\n\n"
+                                "Check `TELEGRAM_2FA_PASSWORD` "
+                                "in Koyeb and try /login again."
+                            )
+
+                            return
+
+                    break
+
+                except asyncio.TimeoutError:
+
+                    logger.info(
+                        "QR token expired; "
+                        "recreating QR token"
+                    )
+
+                    # -------------------------------------------------- #
+                    # Make sure old wait task is gone.
+                    # -------------------------------------------------- #
+
+                    if not wait_task.done():
+                        wait_task.cancel()
+
+                        try:
+                            await wait_task
+
+                        except asyncio.CancelledError:
+                            pass
+
+                    # -------------------------------------------------- #
+                    # Telethon's documented way to refresh
+                    # an expired QR token.
+                    # -------------------------------------------------- #
+
+                    await qr_login.recreate()
+
                     await event.reply(
-                        "⏳ QR expire ho gaya. "
+                        "⏳ QR expire ho gaya.\n\n"
                         "Naya QR bhej raha hoon..."
                     )
 
                     continue
 
                 except SessionPasswordNeededError:
+
+                    # -------------------------------------------------- #
+                    # This can also surface directly from the wait task
+                    # depending on the Telethon version.
+                    # -------------------------------------------------- #
+
                     logger.info(
-                        "QR scan successful; Telegram "
+                        "QR accepted; Telegram "
                         "requires 2FA password"
                     )
 
@@ -442,16 +653,68 @@ class LoginBot:
                         await event.reply(
                             "❌ Telegram 2FA authentication failed.\n\n"
                             "Check `TELEGRAM_2FA_PASSWORD` "
-                            "in Koyeb and try /login again."
+                            "in Koyeb."
                         )
 
                         return
 
-                break
+                    break
 
-            await self._finish_login(event)
+                except Exception:
+                    logger.exception(
+                        "Unexpected QR wait error"
+                    )
+
+                    if not wait_task.done():
+                        wait_task.cancel()
+
+                        try:
+                            await wait_task
+
+                        except asyncio.CancelledError:
+                            pass
+
+                    raise
+
+                finally:
+                    # -------------------------------------------------- #
+                    # If wait_task is somehow still alive, clean it up.
+                    # -------------------------------------------------- #
+
+                    if not wait_task.done():
+                        wait_task.cancel()
+
+                        try:
+                            await wait_task
+
+                        except asyncio.CancelledError:
+                            pass
+
+            # ---------------------------------------------------------- #
+            # Authentication completed.
+            # ---------------------------------------------------------- #
+
+            if not await client.is_user_authorized():
+                await event.reply(
+                    "❌ QR flow finished, but Telegram "
+                    "did not authorize the userbot."
+                )
+
+                logger.error(
+                    "QR flow completed but "
+                    "client is not authorized"
+                )
+
+                return
+
+            await self._finish_login(
+                event
+            )
 
         except asyncio.CancelledError:
+            logger.info(
+                "QR login task cancelled"
+            )
             raise
 
         except Exception as exc:
@@ -464,6 +727,11 @@ class LoginBot:
                 f"Reason: {type(exc).__name__}"
             )
 
+    # ------------------------------------------------------------------ #
+    # Wait for authorization
+    # ------------------------------------------------------------------ #
+
     async def wait_until_authorized(self) -> None:
         """Wait until QR login successfully authorizes the userbot."""
+
         await self._authorized_event.wait()
