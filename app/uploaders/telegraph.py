@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Any
 import httpx
 
+from .common import PART2_IMAGE_MAX_BYTES, UploadError, validate_image_file
+
 TELEGRAPH_UPLOAD_URL = "https://telegra.ph/upload"
 TELEGRAPH_MAX_BYTES = 5 * 1024 * 1024
-PART2_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 
-class UploadError(RuntimeError):
-    """Raised when a Telegraph upload cannot be completed."""
+__all__ = ["TelegraphUploader", "UploadError", "PART2_IMAGE_MAX_BYTES", "TELEGRAPH_UPLOAD_URL"]
 
 class TelegraphUploader:
     """Upload images to Telegraph; videos are deliberately unsupported."""
@@ -22,14 +22,8 @@ class TelegraphUploader:
 
     async def upload(self, path: Path) -> dict[str, Any]:
         path = Path(path)
-        if not path.is_file():
-            raise UploadError(f"Image file does not exist: {path.name}")
-        content_type = mimetypes.guess_type(path.name)[0] or ""
-        if not content_type.startswith("image/"):
-            raise UploadError(f"Telegraph Part 2 accepts images only: {path.name}")
-        size = path.stat().st_size
-        if size > self.max_bytes:
-            raise UploadError(f"Image exceeds Telegraph Part 2 limit ({size} bytes > {self.max_bytes} bytes)")
+        validate_image_file(path, provider="Telegraph", max_bytes=self.max_bytes)
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         for attempt in range(self.max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
