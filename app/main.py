@@ -6,7 +6,7 @@ import asyncio
 import logging
 import signal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .archive_processor import safe_extract, validate_archive
 from .config import ConfigError, Settings
@@ -20,14 +20,11 @@ from .job_manager import (
 from .logging_config import setup_logging
 from .login_bot import LoginBot
 from .media_scanner import scan_directory
+from .progress import ProgressRenderer
 from .telegram_client import TelegramUserbot
 from .uploaders.imgbb import (
     ImgBBUploader,
     UploadError as ImgBBUploadError,
-)
-from .uploaders.telegraph import (
-    TelegraphUploader,
-    UploadError as TelegraphUploadError,
 )
 
 logger = logging.getLogger("app.main")
@@ -83,31 +80,7 @@ async def _health_handler(
 
 
 class PipelineWorker:
-    """
-    Background worker for archive processing.
-
-    Part 2 workflow:
-
-        Telegram ZIP
-            ↓
-        Download
-            ↓
-        Validate ZIP
-            ↓
-        Extract
-            ↓
-        Scan
-            ↓
-        Images
-          ├── ImgBB
-          └── Telegraph
-            ↓
-        Complete
-
-    Videos are ONLY detected here.
-
-    Video → target Telegram bot is intentionally deferred to Part 3.
-    """
+    """Background worker for archive/media processing."""
 
     def __init__(
         self,
@@ -121,15 +94,11 @@ class PipelineWorker:
         self._workers: list[asyncio.Task] = []
         self._stopping = False
 
-        # ------------------------------------------------------------------
-        # Part 2 uploaders
-        # ------------------------------------------------------------------
+        self.progress = ProgressRenderer()
 
         self.imgbb_uploader = ImgBBUploader(
             api_key=settings.imgbb_api_key,
         )
-
-        self.telegraph_uploader = TelegraphUploader()
 
     # ------------------------------------------------------------------
     # QUEUE
@@ -139,7 +108,7 @@ class PipelineWorker:
         self,
         job: Job,
     ) -> None:
-        """Submit a Job object to the processing queue."""
+        """Submit a Job to the actual processing queue."""
 
         if self._stopping:
             raise RuntimeError(
@@ -232,11 +201,7 @@ class PipelineWorker:
                 except Exception:
                     logger.exception(
                         "Unhandled error processing job %s",
-                        getattr(
-                            job,
-                            "job_id",
-                            "unknown",
-                        ),
+                        job.job_id,
                     )
 
                 finally:
@@ -257,35 +222,35 @@ class PipelineWorker:
         )
 
     # ------------------------------------------------------------------
-    # MAIN PROCESSING
+    # PROCESS
     # ------------------------------------------------------------------
 
     async def _process(
         self,
         job: Job,
     ) -> None:
-        """Run the complete Part 2 archive/image pipeline."""
+        """Run the complete Part 2 processing pipeline."""
 
         job_id = job.job_id
 
         try:
-            # ==============================================================
+            # ==========================================================
             # DOWNLOAD
-            # ==============================================================
+            # ==========================================================
 
             self.job_manager.set_status(
                 job_id,
                 JobStatus.DOWNLOADING,
             )
 
+            await self._notify(job)
+
             logger.info(
                 "Job %s: downloading archive",
                 job_id,
             )
 
-            archive_path = await self._download(
-                job,
-            )
+            archive_path = await self._download(job)
 
             logger.info(
                 "Job %s: download completed: %s",
@@ -293,9 +258,11 @@ class PipelineWorker:
                 archive_path,
             )
 
-            # ==============================================================
-            # VALIDATE ZIP
-            # ==============================================================
+            # ==========================================================
+            # VALIDATE
+            # ==========================================================
+
+            await self._notify(job)
 
             logger.info(
                 "Job %s: validating archive",
@@ -332,19 +299,26 @@ class PipelineWorker:
                 archive_info.compression_ratio,
             )
 
-            # ==============================================================
+            # ==========================================================
             # EXTRACT
-            # ==============================================================
+            # ==========================================================
 
             self.job_manager.set_status(
                 job_id,
                 JobStatus.EXTRACTING,
             )
 
+            await self._notify(job)
+
             logger.info(
                 "Job %s: extracting archive",
                 job_id,
             )
+
+            if not job.extract_dir:
+                raise RuntimeError(
+                    "Job extract directory is not configured"
+                )
 
             extraction_result = await asyncio.to_thread(
                 safe_extract,
@@ -355,8 +329,8 @@ class PipelineWorker:
 
             self.job_manager.set_extraction_stats(
                 job_id,
-                files=extraction_result.extracted_files,
-                bytes_total=extraction_result.total_bytes,
+                file_count=extraction_result.extracted_files,
+                total_size_bytes=extraction_result.total_bytes,
             )
 
             logger.info(
@@ -366,14 +340,16 @@ class PipelineWorker:
                 extraction_result.total_bytes,
             )
 
-            # ==============================================================
+            # ==========================================================
             # SCAN
-            # ==============================================================
+            # ==========================================================
 
             self.job_manager.set_status(
                 job_id,
                 JobStatus.SCANNING,
             )
+
+            await self._notify(job)
 
             logger.info(
                 "Job %s: scanning media",
@@ -387,9 +363,9 @@ class PipelineWorker:
 
             self.job_manager.set_media_counts(
                 job_id,
-                images=scan_result.image_count,
-                videos=scan_result.video_count,
-                ignored=scan_result.ignored_count,
+                image_count=scan_result.image_count,
+                video_count=scan_result.video_count,
+                ignored_count=scan_result.ignored_count,
             )
 
             logger.info(
@@ -401,7 +377,6 @@ class PipelineWorker:
                 scan_result.ignored_count,
             )
 
-            # Save scan information for future Part 3.
             self.job_manager.set_metadata(
                 job_id,
                 "scan_counts",
@@ -426,9 +401,9 @@ class PipelineWorker:
                 ],
             )
 
-            # ==============================================================
-            # PART 2 — IMAGE UPLOAD
-            # ==============================================================
+            # ==========================================================
+            # IMAGE UPLOAD
+            # ==========================================================
 
             if scan_result.image_count > 0:
                 self.job_manager.set_status(
@@ -436,25 +411,21 @@ class PipelineWorker:
                     JobStatus.UPLOADING,
                 )
 
-                logger.info(
-                    "Job %s: starting image uploads",
-                    job_id,
-                )
+                await self._notify(job)
 
                 await self._upload_images(
                     job,
-                    scan_result,
+                    scan_result.images,
                 )
 
-            # ==============================================================
-            # VIDEOS — PART 3 PLACEHOLDER
-            # ==============================================================
+            # ==========================================================
+            # VIDEO — PART 3
+            # ==========================================================
 
             if scan_result.video_count > 0:
                 logger.info(
                     "Job %s: detected %s video(s); "
-                    "target Telegram bot workflow is "
-                    "reserved for Part 3",
+                    "video-bot processing reserved for Part 3",
                     job_id,
                     scan_result.video_count,
                 )
@@ -481,45 +452,33 @@ class PipelineWorker:
                     "not_required",
                 )
 
-            # ==============================================================
+            # ==========================================================
             # FINAL STATUS
-            # ==============================================================
+            # ==========================================================
 
             if job.upload_failures:
                 self.job_manager.complete_with_errors(
                     job_id,
                 )
-
-                logger.warning(
-                    "Job %s completed with %s upload failure(s)",
-                    job_id,
-                    len(job.upload_failures),
-                )
-
             else:
                 self.job_manager.complete(
                     job_id,
                 )
 
-                logger.info(
-                    "Job %s completed successfully",
-                    job_id,
-                )
+            await self._notify(job)
 
-        # ==================================================================
-        # CANCELLATION
-        # ==================================================================
+            logger.info(
+                "Job %s finished with status=%s",
+                job_id,
+                job.status,
+            )
 
         except asyncio.CancelledError:
             logger.info(
-                "Job %s: worker task cancelled",
+                "Job %s: processing task cancelled",
                 job_id,
             )
             raise
-
-        # ==================================================================
-        # FAILURE
-        # ==================================================================
 
         except Exception as exc:
             logger.exception(
@@ -532,61 +491,42 @@ class PipelineWorker:
                     job_id,
                 )
 
-                if current_job.status not in {
-                    JobStatus.COMPLETED,
-                    JobStatus.COMPLETED_WITH_ERRORS,
-                    JobStatus.FAILED,
-                    JobStatus.CANCELLED,
-                }:
+                if not current_job.is_terminal():
                     self.job_manager.set_error(
                         job_id,
                         f"{type(exc).__name__}: {exc}",
                         failed=True,
                     )
 
-            except Exception:
-                logger.exception(
-                    "Job %s: failed to update final error state",
-                    job_id,
+                await self._notify(
+                    current_job,
                 )
 
-        # ==================================================================
-        # CLEANUP
-        # ==================================================================
+            except Exception:
+                logger.exception(
+                    "Job %s: could not update failure state",
+                    job_id,
+                )
 
         finally:
-            try:
-                self.job_manager.remove_from_queue(
-                    job_id,
-                )
-
-            except Exception:
-                logger.exception(
-                    "Job %s: queue bookkeeping failed",
-                    job_id,
-                )
+            self.job_manager.remove_from_queue(
+                job_id,
+            )
 
             if not self.settings.keep_job_files:
-                try:
-                    self.job_manager.cleanup_job_files(
-                        job_id,
-                    )
-
-                except Exception:
-                    logger.exception(
-                        "Job %s: cleanup failed",
-                        job_id,
-                    )
+                self.job_manager.cleanup_job_files(
+                    job_id,
+                )
 
     # ------------------------------------------------------------------
-    # TELEGRAM DOWNLOAD
+    # DOWNLOAD
     # ------------------------------------------------------------------
 
     async def _download(
         self,
         job: Job,
     ) -> Path:
-        """Download the source Telegram document."""
+        """Download ZIP from Telegram."""
 
         message = getattr(
             job,
@@ -628,57 +568,29 @@ class PipelineWorker:
 
         if not downloaded_path.is_file():
             raise RuntimeError(
-                "Downloaded Telegram file does not exist"
+                "Downloaded file does not exist"
             )
 
         return downloaded_path
 
     # ------------------------------------------------------------------
-    # IMAGE UPLOADS
+    # IMAGE UPLOAD
     # ------------------------------------------------------------------
 
     async def _upload_images(
         self,
         job: Job,
-        scan_result: Any,
+        images: list[Any],
     ) -> None:
-        """
-        Upload each image to both ImgBB and Telegraph.
+        """Upload detected images to ImgBB."""
 
-        IMPORTANT:
-        Videos never enter this method.
-        """
+        for media in images:
+            if job.cancel_requested:
+                raise asyncio.CancelledError()
 
-        image_files = getattr(
-            scan_result,
-            "images",
-            [],
-        )
-
-        for media in image_files:
-            image_path = self._safe_media_path(
-                media,
+            image_path = Path(
+                media.path,
             )
-
-            if image_path is None:
-                filename = getattr(
-                    media,
-                    "filename",
-                    "unknown",
-                )
-
-                self.job_manager.add_upload_failure(
-                    job.job_id,
-                    UploadFailure(
-                        provider="local",
-                        media_type="image",
-                        filename=str(filename),
-                        path="",
-                        error="Image file is missing or invalid",
-                    ),
-                )
-
-                continue
 
             filename = getattr(
                 media,
@@ -686,13 +598,13 @@ class PipelineWorker:
                 image_path.name,
             )
 
-            # ==========================================================
-            # IMGBB
-            # ==========================================================
+            # ----------------------------------------------------------
+            # ImgBB
+            # ----------------------------------------------------------
 
             try:
                 logger.info(
-                    "Job %s: ImgBB upload started: %s",
+                    "Job %s: uploading image to ImgBB: %s",
                     job.job_id,
                     filename,
                 )
@@ -705,40 +617,37 @@ class PipelineWorker:
                     provider="imgbb",
                     media_type="image",
                     filename=str(filename),
-                    path=str(image_path),
                     url=str(
-                        response.get(
-                            "url",
-                            "",
-                        )
+                        response.get("url", "")
                     ),
                     display_url=response.get(
-                        "display_url",
+                        "display_url"
                     ),
                     provider_id=response.get(
-                        "id",
+                        "id"
                     ),
                     size_bytes=response.get(
-                        "size_bytes",
+                        "size"
                     ),
                     width=response.get(
-                        "width",
+                        "width"
                     ),
                     height=response.get(
-                        "height",
+                        "height"
                     ),
-                    metadata=response,
+                    extra={
+                        "path": str(image_path),
+                        "relative_path": getattr(
+                            media,
+                            "relative_path",
+                            "",
+                        ),
+                    },
                 )
 
                 self.job_manager.add_upload_result(
                     job.job_id,
                     result,
-                )
-
-                logger.info(
-                    "Job %s: ImgBB upload successful: %s",
-                    job.job_id,
-                    filename,
                 )
 
             except ImgBBUploadError as exc:
@@ -755,8 +664,10 @@ class PipelineWorker:
                         provider="imgbb",
                         media_type="image",
                         filename=str(filename),
-                        path=str(image_path),
                         error=str(exc),
+                        extra={
+                            "path": str(image_path),
+                        },
                     ),
                 )
 
@@ -773,131 +684,53 @@ class PipelineWorker:
                         provider="imgbb",
                         media_type="image",
                         filename=str(filename),
-                        path=str(image_path),
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=(
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        extra={
+                            "path": str(image_path),
+                        },
                     ),
                 )
 
-            # ==========================================================
-            # TELEGRAPH
-            # ==========================================================
-
-            try:
-                logger.info(
-                    "Job %s: Telegraph upload started: %s",
-                    job.job_id,
-                    filename,
-                )
-
-                response = await self.telegraph_uploader.upload(
-                    image_path,
-                )
-
-                telegraph_url = str(
-                    response.get(
-                        "url",
-                        "",
-                    )
-                )
-
-                result = UploadResult(
-                    provider="telegraph",
-                    media_type="image",
-                    filename=str(filename),
-                    path=str(image_path),
-                    url=telegraph_url,
-                    display_url=telegraph_url or None,
-                    provider_id=None,
-                    size_bytes=response.get(
-                        "size_bytes",
-                    ),
-                    width=response.get(
-                        "width",
-                    ),
-                    height=response.get(
-                        "height",
-                    ),
-                    metadata=response,
-                )
-
-                self.job_manager.add_upload_result(
-                    job.job_id,
-                    result,
-                )
-
-                logger.info(
-                    "Job %s: Telegraph upload successful: %s",
-                    job.job_id,
-                    filename,
-                )
-
-            except TelegraphUploadError as exc:
-                logger.warning(
-                    "Job %s: Telegraph upload failed for %s: %s",
-                    job.job_id,
-                    filename,
-                    exc,
-                )
-
-                self.job_manager.add_upload_failure(
-                    job.job_id,
-                    UploadFailure(
-                        provider="telegraph",
-                        media_type="image",
-                        filename=str(filename),
-                        path=str(image_path),
-                        error=str(exc),
-                    ),
-                )
-
-            except Exception as exc:
-                logger.exception(
-                    "Job %s: unexpected Telegraph error for %s",
-                    job.job_id,
-                    filename,
-                )
-
-                self.job_manager.add_upload_failure(
-                    job.job_id,
-                    UploadFailure(
-                        provider="telegraph",
-                        media_type="image",
-                        filename=str(filename),
-                        path=str(image_path),
-                        error=f"{type(exc).__name__}: {exc}",
-                    ),
-                )
+            await self._notify(job)
 
     # ------------------------------------------------------------------
-    # MEDIA PATH
+    # PROGRESS
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _safe_media_path(
-        media: Any,
-    ) -> Optional[Path]:
-        """Extract and validate a detected media path."""
+    async def _notify(
+        self,
+        job: Job,
+    ) -> None:
+        """Edit the Telegram status message."""
 
-        value = getattr(
-            media,
-            "path",
+        status_message = getattr(
+            job,
+            "_status_message",
             None,
         )
 
-        if value is None:
-            return None
-
-        path = Path(
-            value,
-        )
+        if status_message is None:
+            return
 
         try:
-            if not path.is_file():
-                return None
-        except OSError:
-            return None
+            text = self.progress.render(
+                job,
+            )
 
-        return path
+            await status_message.edit(
+                text,
+                parse_mode="html",
+            )
+
+        except Exception:
+            # Telegram edit errors must never kill the media pipeline.
+            logger.debug(
+                "Could not update progress message for job %s",
+                job.job_id,
+                exc_info=True,
+            )
 
 
 # ============================================================================
@@ -906,7 +739,7 @@ class PipelineWorker:
 
 
 class Application:
-    """Coordinate health server, Telegram clients and pipeline."""
+    """Coordinate health server, pipeline, userbot and login bot."""
 
     def __init__(
         self,
@@ -914,23 +747,38 @@ class Application:
     ) -> None:
         self.settings = settings
 
-        self.job_manager: Optional[JobManager] = None
-        self.pipeline: Optional[PipelineWorker] = None
-        self.userbot: Optional[TelegramUserbot] = None
-        self.login_bot: Optional[LoginBot] = None
+        self.job_manager = JobManager(
+            settings.job_dir,
+        )
 
-        self.health_server: Optional[
-            asyncio.AbstractServer
-        ] = None
+        self.pipeline = PipelineWorker(
+            settings,
+            self.job_manager,
+        )
+
+        self.userbot = TelegramUserbot(
+            settings,
+            self.job_manager,
+            self.pipeline,
+        )
+
+        self.login_bot = LoginBot(
+            settings,
+            self.userbot,
+        )
+
+        self.health_server: asyncio.AbstractServer | None = None
 
         self._stop_event = asyncio.Event()
 
-    # ------------------------------------------------------------------
-    # HEALTH SERVER
-    # ------------------------------------------------------------------
+    async def start(self) -> None:
+        """Start all application components."""
 
-    async def start_health_server(self) -> None:
-        """Start HTTP health server for Koyeb."""
+        self.settings.ensure_directories()
+
+        # --------------------------------------------------------------
+        # Health server
+        # --------------------------------------------------------------
 
         self.health_server = await asyncio.start_server(
             _health_handler,
@@ -944,129 +792,83 @@ class Application:
             HEALTH_PORT,
         )
 
-    async def stop_health_server(self) -> None:
-        """Stop HTTP health server."""
-
-        if self.health_server is None:
-            return
-
-        self.health_server.close()
-
-        await self.health_server.wait_closed()
-
-        self.health_server = None
-
-        logger.info(
-            "Health server stopped"
-        )
-
-    # ------------------------------------------------------------------
-    # START
-    # ------------------------------------------------------------------
-
-    async def start(self) -> None:
-        """Start all application components."""
-
-        logger.info(
-            "Starting Telegram Media Processor (PART 2)"
-        )
-
-        self.settings.ensure_directories()
-
-        # Health server must start early for Koyeb.
-        await self.start_health_server()
-
-        # --------------------------------------------------------------
-        # Job manager
-        # --------------------------------------------------------------
-
-        self.job_manager = JobManager(
-            self.settings.job_dir,
-        )
-
         # --------------------------------------------------------------
         # Pipeline
         # --------------------------------------------------------------
 
-        self.pipeline = PipelineWorker(
-            self.settings,
-            self.job_manager,
-        )
+        await self.pipeline.start()
 
         # --------------------------------------------------------------
-        # Telegram userbot
-        # --------------------------------------------------------------
-
-        self.userbot = TelegramUserbot(
-            self.settings,
-            self.job_manager,
-            self.pipeline,
-        )
-
-        # --------------------------------------------------------------
-        # QR login bot
-        # --------------------------------------------------------------
-
-        self.login_bot = LoginBot(
-            self.settings,
-            self.userbot,
-        )
-
-        # --------------------------------------------------------------
-        # Start userbot
+        # Userbot
         # --------------------------------------------------------------
 
         await self.userbot.start()
 
-        authorized = (
-            await self.userbot.client.is_user_authorized()
-        )
-
-        if authorized:
+        if await self.userbot.client.is_user_authorized():
             logger.info(
                 "Existing Telegram userbot session is authorized"
             )
-
         else:
-            if not self.settings.bot_token:
-                raise ConfigError(
-                    "BOT_TOKEN is required for first-time QR login"
-                )
-
-            if self.settings.bot_owner_id is None:
-                raise ConfigError(
-                    "BOT_OWNER_ID is required for first-time QR login"
-                )
-
             logger.info(
-                "Telegram userbot is not authorized; "
-                "starting QR login bot"
-            )
-
-            await self.login_bot.start()
-
-            await self.login_bot.wait_until_authorized()
-
-            logger.info(
-                "QR authentication completed"
+                "Telegram userbot is waiting for QR login"
             )
 
         # --------------------------------------------------------------
-        # Start pipeline
+        # Login bot
         # --------------------------------------------------------------
 
-        await self.pipeline.start()
+        await self.login_bot.start()
 
         logger.info(
             "Telegram Media Processor is ready"
         )
 
-    # ------------------------------------------------------------------
-    # RUN
-    # ------------------------------------------------------------------
+    async def stop(self) -> None:
+        """Stop all application components."""
+
+        logger.info(
+            "Stopping Telegram Media Processor"
+        )
+
+        self._stop_event.set()
+
+        if self.health_server is not None:
+            self.health_server.close()
+
+            try:
+                await self.health_server.wait_closed()
+            except Exception:
+                pass
+
+            self.health_server = None
+
+        try:
+            await self.login_bot.stop()
+        except Exception:
+            logger.exception(
+                "Login bot shutdown failed"
+            )
+
+        try:
+            await self.userbot.stop()
+        except Exception:
+            logger.exception(
+                "Userbot shutdown failed"
+            )
+
+        try:
+            await self.pipeline.stop()
+        except Exception:
+            logger.exception(
+                "Pipeline shutdown failed"
+            )
+
+        logger.info(
+            "Telegram Media Processor stopped"
+        )
 
     async def run(self) -> None:
-        """Run until shutdown is requested."""
+        """Start application and wait for shutdown."""
 
         await self.start()
 
@@ -1076,50 +878,80 @@ class Application:
         finally:
             await self.stop()
 
-    # ------------------------------------------------------------------
-    # STOP
-    # ------------------------------------------------------------------
-
-    async def stop(self) -> None:
-        """Gracefully stop all components."""
-
-        logger.info(
-            "Stopping Telegram Media Processor"
-        )
-
-        if self.pipeline is not None:
-            await self.pipeline.stop()
-
-        if self.login_bot is not None:
-            await self.login_bot.stop()
-
-        if self.userbot is not None:
-            await self.userbot.stop()
-
-        await self.stop_health_server()
-
-        logger.info(
-            "Telegram Media Processor stopped"
-        )
-
     def request_stop(self) -> None:
-        """Request graceful shutdown."""
+        """Request graceful application shutdown."""
 
         self._stop_event.set()
 
 
 # ============================================================================
-# ENTRYPOINT
+# SIGNAL HANDLING
+# ============================================================================
+
+
+def _install_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    application: Application,
+) -> None:
+    """Install SIGINT/SIGTERM handlers where supported."""
+
+    def handle_signal() -> None:
+        logger.info(
+            "Shutdown signal received"
+        )
+
+        application.request_stop()
+
+    for sig in (
+        signal.SIGINT,
+        signal.SIGTERM,
+    ):
+        try:
+            loop.add_signal_handler(
+                sig,
+                handle_signal,
+            )
+
+        except (
+            NotImplementedError,
+            RuntimeError,
+        ):
+            # Windows/event-loop implementations may not support this.
+            logger.debug(
+                "Signal handler unavailable for %s",
+                sig,
+            )
+
+
+# ============================================================================
+# ENTRY POINT
 # ============================================================================
 
 
 async def async_main() -> None:
     """Async application entry point."""
 
-    settings = Settings.from_env()
+    try:
+        settings = Settings.from_env()
+
+    except ConfigError:
+        # Logging may not be configured yet, so use stderr/default logger.
+        logging.basicConfig(
+            level=logging.ERROR,
+        )
+
+        logger.exception(
+            "Configuration error"
+        )
+
+        raise
 
     setup_logging(
         settings,
+    )
+
+    logger.info(
+        "Starting Telegram Media Processor (PART 2)"
     )
 
     application = Application(
@@ -1128,33 +960,16 @@ async def async_main() -> None:
 
     loop = asyncio.get_running_loop()
 
-    for signal_name in (
-        "SIGINT",
-        "SIGTERM",
-    ):
-        try:
-            signal_value = getattr(
-                signal,
-                signal_name,
-            )
-
-            loop.add_signal_handler(
-                signal_value,
-                application.request_stop,
-            )
-
-        except (
-            AttributeError,
-            NotImplementedError,
-        ):
-            # Restricted runtimes / Windows.
-            pass
+    _install_signal_handlers(
+        loop,
+        application,
+    )
 
     await application.run()
 
 
 def main() -> None:
-    """Synchronous entry point."""
+    """Synchronous application entry point."""
 
     try:
         asyncio.run(
@@ -1162,27 +977,9 @@ def main() -> None:
         )
 
     except KeyboardInterrupt:
-        logging.getLogger(
-            "app.main"
-        ).info(
+        logger.info(
             "Application interrupted by user"
         )
-
-    except ConfigError:
-        logging.getLogger(
-            "app.main"
-        ).exception(
-            "Configuration error"
-        )
-        raise
-
-    except Exception:
-        logging.getLogger(
-            "app.main"
-        ).exception(
-            "Application terminated unexpectedly"
-        )
-        raise
 
 
 if __name__ == "__main__":
