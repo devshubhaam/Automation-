@@ -403,7 +403,7 @@ class TelegramUserbot:
             "",
             f"Total jobs: {len(jobs)}",
             f"Active jobs: {len(active_jobs)}",
-            f"Queued jobs: {self.job_manager.queue_size()}",
+            f"Queued jobs: {self.pipeline.queue_size()}",
             "",
         ]
 
@@ -500,7 +500,8 @@ class TelegramUserbot:
 
         await event.reply(
             f"🛑 Cancellation requested for job "
-            f"`{self._escape(job_id)}`.",
+            f"<code>{self._escape(job_id)}</code>. "
+            f"It will stop at the next safe point.",
             parse_mode="html",
         )
 
@@ -612,15 +613,15 @@ class TelegramUserbot:
             job._status_message = status_message
 
             # ----------------------------------------------------------
-            # Queue bookkeeping
+            # State: QUEUED (JobManager keeps state only, no queue)
             # ----------------------------------------------------------
 
-            await self.job_manager.enqueue(
+            self.job_manager.mark_queued(
                 job.job_id
             )
 
             # ----------------------------------------------------------
-            # Submit to actual processing pipeline
+            # Submit to the one real processing queue (PipelineWorker)
             # ----------------------------------------------------------
 
             await self.pipeline.submit(
