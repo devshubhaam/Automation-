@@ -6,21 +6,23 @@ from pathlib import Path
 from typing import Any
 import httpx
 
+from .common import PART2_IMAGE_MAX_BYTES, UploadError, redact, validate_image_file
+
 IMGBB_UPLOAD_URL = "https://api.imgbb.com/1/upload"
 
-class UploadError(RuntimeError):
-    """Raised when an ImgBB upload cannot be completed."""
+__all__ = ["ImgBBUploader", "UploadError", "IMGBB_UPLOAD_URL"]
 
 class ImgBBUploader:
-    def __init__(self, api_key: str | None, *, timeout_seconds: float = 120.0, max_retries: int = 3) -> None:
+    """Upload images to ImgBB; videos are deliberately unsupported."""
+    def __init__(self, api_key: str | None, *, timeout_seconds: float = 120.0, max_retries: int = 3, max_bytes: int = PART2_IMAGE_MAX_BYTES) -> None:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, int(max_retries))
+        self.max_bytes = int(max_bytes)
 
     async def upload(self, path: Path) -> dict[str, Any]:
         path = Path(path)
-        if not path.is_file():
-            raise UploadError(f"Image file does not exist: {path.name}")
+        validate_image_file(path, provider="ImgBB", max_bytes=self.max_bytes)
         if not self.api_key:
             raise UploadError("IMGBB_API_KEY is not configured")
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -47,7 +49,7 @@ class ImgBBUploader:
                 if not payload.get("success"):
                     error = payload.get("error") or {}
                     message = error.get("message") if isinstance(error, dict) else str(error)
-                    raise UploadError(message or "ImgBB upload failed")
+                    raise UploadError(redact(message or "ImgBB upload failed", self.api_key))
                 data = payload.get("data") or {}
                 url = data.get("url")
                 if not url:
