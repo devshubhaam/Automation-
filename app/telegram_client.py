@@ -24,13 +24,13 @@ class TelegramUserbot:
     """Telegram userbot wrapper.
 
     Responsibilities:
-    - Maintain the Telethon user session.
-    - Restrict commands/media processing to the owner.
+    - Maintain Telethon user session.
+    - Restrict processing to the owner account.
     - Accept ZIP archives.
-    - Create jobs using the current JobManager API.
+    - Create jobs.
     - Submit jobs to PipelineWorker.
     - Provide /ping, /start, /status and /cancel.
-    - Persist the Telegram StringSession to MongoDB.
+    - Persist StringSession to MongoDB.
     """
 
     def __init__(
@@ -45,9 +45,9 @@ class TelegramUserbot:
 
         self.session_store: Optional[MongoSessionStore] = None
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # Telegram session source
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
 
         session_source = str(settings.session_path)
 
@@ -100,9 +100,9 @@ class TelegramUserbot:
                 "using local Telegram session"
             )
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # Telethon client
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
 
         self.client = TelegramClient(
             session_source,
@@ -118,15 +118,14 @@ class TelegramUserbot:
 
         self._handlers_registered = False
 
-    # ======================================================================
+    # ==================================================================
     # START / STOP
-    # ======================================================================
+    # ==================================================================
 
     async def start(self) -> None:
         """Connect to Telegram.
 
-        This method does not perform interactive login.
-        First-time authentication is handled by LoginBot/QR flow.
+        Interactive first-time login is handled by LoginBot.
         """
 
         logger.info(
@@ -194,9 +193,6 @@ class TelegramUserbot:
         """Persist current authorized Telegram session to MongoDB."""
 
         if self.session_store is None:
-            logger.debug(
-                "MongoDB session storage is disabled"
-            )
             return
 
         if not await self.client.is_user_authorized():
@@ -228,7 +224,7 @@ class TelegramUserbot:
             raise
 
     async def stop(self) -> None:
-        """Persist the session and disconnect Telegram."""
+        """Persist session and disconnect Telegram."""
 
         if self.session_store is not None:
             try:
@@ -256,9 +252,9 @@ class TelegramUserbot:
             "Telegram client stopped"
         )
 
-    # ======================================================================
+    # ==================================================================
     # EVENT HANDLERS
-    # ======================================================================
+    # ==================================================================
 
     def register_handlers(self) -> None:
         """Register Telegram handlers exactly once."""
@@ -307,9 +303,9 @@ class TelegramUserbot:
             message.raw_text or ""
         ).strip()
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # Commands
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
 
         if text:
             command = (
@@ -347,27 +343,27 @@ class TelegramUserbot:
                 )
                 return
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # ZIP document
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
 
         if message.document:
             await self.handle_zip(message)
 
-    # ======================================================================
+    # ==================================================================
     # OWNER CHECK
-    # ======================================================================
+    # ==================================================================
 
     def is_owner_message(
         self,
         event,
     ) -> bool:
-        """Return True only for messages belonging to the owner."""
+        """Allow only messages belonging to authenticated owner."""
 
         if self.owner_id is None:
             return False
 
-        # Outgoing messages are generated by the authenticated account.
+        # Outgoing messages originate from the authenticated account.
         if event.out:
             return True
 
@@ -380,9 +376,9 @@ class TelegramUserbot:
             self.owner_id
         )
 
-    # ======================================================================
+    # ==================================================================
     # STATUS
-    # ======================================================================
+    # ==================================================================
 
     async def handle_status(
         self,
@@ -411,11 +407,11 @@ class TelegramUserbot:
             "",
         ]
 
-        # Show latest 10 jobs.
+        # Latest 10 jobs only.
         for job in jobs[-10:]:
             lines.append(
                 f"<code>{self._escape(job.job_id)}</code> "
-                f"— {self._escape(job.status.value)}"
+                f"— {self._escape(job.status)}"
             )
 
         await event.reply(
@@ -423,16 +419,16 @@ class TelegramUserbot:
             parse_mode="html",
         )
 
-    # ======================================================================
+    # ==================================================================
     # CANCEL
-    # ======================================================================
+    # ==================================================================
 
     async def handle_cancel(
         self,
         event,
         text: str,
     ) -> None:
-        """Cancel a job using the current JobManager API."""
+        """Cancel a job."""
 
         parts = text.split(
             maxsplit=1
@@ -460,28 +456,33 @@ class TelegramUserbot:
 
         if job is None:
             await event.reply(
-                f"❌ Job `{self._escape(job_id)}` was not found.",
+                f"❌ Job "
+                f"`{self._escape(job_id)}` "
+                f"was not found.",
                 parse_mode="html",
             )
             return
 
-        if job.status in {
+        terminal_states = {
             JobStatus.COMPLETED,
             JobStatus.COMPLETED_WITH_ERRORS,
             JobStatus.FAILED,
             JobStatus.CANCELLED,
-        }:
+        }
+
+        if job.status in terminal_states:
             await event.reply(
-                f"ℹ️ Job `{self._escape(job_id)}` is already "
-                f"`{self._escape(job.status.value)}`.",
+                f"ℹ️ Job "
+                f"`{self._escape(job_id)}` "
+                f"is already "
+                f"`{self._escape(job.status)}`.",
                 parse_mode="html",
             )
             return
 
         try:
             self.job_manager.cancel(
-                job_id,
-                reason="Cancelled by owner",
+                job_id
             )
 
         except Exception:
@@ -503,15 +504,15 @@ class TelegramUserbot:
             parse_mode="html",
         )
 
-    # ======================================================================
+    # ==================================================================
     # ZIP HANDLING
-    # ======================================================================
+    # ==================================================================
 
     async def handle_zip(
         self,
         message: Message,
     ) -> None:
-        """Validate and submit a ZIP document."""
+        """Validate and submit a ZIP archive."""
 
         if not message.document:
             return
@@ -548,10 +549,6 @@ class TelegramUserbot:
             or 0
         )
 
-        # ------------------------------------------------------------------
-        # Owner/user/chat IDs
-        # ------------------------------------------------------------------
-
         sender_id = message.sender_id
 
         if sender_id is None:
@@ -571,13 +568,15 @@ class TelegramUserbot:
             )
             return
 
-        # ------------------------------------------------------------------
-        # Generate job ID
-        # ------------------------------------------------------------------
-
-        job_id = self.job_manager.generate_job_id()
+        job = None
 
         try:
+            # ----------------------------------------------------------
+            # Create job
+            # ----------------------------------------------------------
+
+            job_id = self.job_manager.generate_job_id()
+
             job = self.job_manager.create_job(
                 job_id=job_id,
                 user_id=int(sender_id),
@@ -586,21 +585,20 @@ class TelegramUserbot:
                 message_id=int(message.id),
             )
 
-            # PipelineWorker uses this object to download
-            # the Telegram document.
-            #
-            # This is runtime-only data and is intentionally not
-            # serialized into JobManager state.
+            # Runtime-only Telegram Message object.
+            # PipelineWorker uses this for download_media().
             job._telegram_message = message
 
-            # ----------------------------------------------------------------
-            # Create status message
-            # ----------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Create editable status message
+            # ----------------------------------------------------------
 
             status_message = await message.reply(
                 "📥 <b>ZIP received.</b>\n\n"
-                f"<b>Job:</b> <code>{self._escape(job.job_id)}</code>\n"
-                f"<b>File:</b> {self._escape(filename)}\n\n"
+                f"<b>Job:</b> "
+                f"<code>{self._escape(job.job_id)}</code>\n"
+                f"<b>File:</b> "
+                f"{self._escape(filename)}\n\n"
                 "⏳ Queuing job...",
                 parse_mode="html",
             )
@@ -610,21 +608,28 @@ class TelegramUserbot:
                 int(status_message.id),
             )
 
-            # ----------------------------------------------------------------
-            # Queue job
-            # ----------------------------------------------------------------
+            # Keep runtime reference so PipelineWorker can edit it.
+            job._status_message = status_message
+
+            # ----------------------------------------------------------
+            # Queue bookkeeping
+            # ----------------------------------------------------------
 
             await self.job_manager.enqueue(
                 job.job_id
             )
 
-            # PipelineWorker owns actual processing.
+            # ----------------------------------------------------------
+            # Submit to actual processing pipeline
+            # ----------------------------------------------------------
+
             await self.pipeline.submit(
                 job
             )
 
             logger.info(
-                "ZIP accepted: job_id=%s filename=%s size=%s",
+                "ZIP accepted: "
+                "job_id=%s filename=%s size=%s",
                 job.job_id,
                 filename,
                 document_size,
@@ -637,8 +642,7 @@ class TelegramUserbot:
                 message.id,
             )
 
-            # If a Job was created, mark it failed.
-            if "job" in locals():
+            if job is not None:
                 try:
                     self.job_manager.set_error(
                         job.job_id,
@@ -652,20 +656,74 @@ class TelegramUserbot:
                         job.job_id,
                     )
 
+                try:
+                    await self._safe_edit(
+                        job,
+                        "❌ <b>Job failed to start.</b>\n\n"
+                        f"<code>{self._escape(job.job_id)}</code>\n"
+                        f"{self._escape(str(exc))}",
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Failed to update failed-job message"
+                    )
+
             else:
                 await message.reply(
                     "❌ Failed to start processing."
                 )
 
-    # ======================================================================
+    # ==================================================================
     # HELPERS
-    # ======================================================================
+    # ==================================================================
+
+    async def _safe_edit(
+        self,
+        job,
+        text: str,
+    ) -> None:
+        """Safely edit the job's status message."""
+
+        status_message = getattr(
+            job,
+            "_status_message",
+            None,
+        )
+
+        if status_message is None:
+            status_message_id = (
+                job.status_message_id
+            )
+
+            if status_message_id is None:
+                return
+
+            status_message = await self.client.get_messages(
+                job.chat_id,
+                ids=status_message_id,
+            )
+
+        if status_message is None:
+            return
+
+        try:
+            await status_message.edit(
+                text,
+                parse_mode="html",
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to edit status message for job %s",
+                job.job_id,
+            )
 
     @staticmethod
     def _document_filename(
         message: Message,
     ) -> str:
-        """Get a safe filename from a Telegram document."""
+        """Get safe filename from Telegram document."""
 
         document = message.document
 
@@ -684,7 +742,6 @@ class TelegramUserbot:
             )
 
             if filename:
-                # Keep only the basename.
                 safe_name = Path(
                     filename
                 ).name
