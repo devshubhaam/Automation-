@@ -1,0 +1,31 @@
+# Secrets & session (NEVER commit these)
+.env
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Runtime data
+jobs/
+logs/
+temp/
+downloads/
+data/sessions/
+data/downloads/
+data/jobs/
+data/logs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
