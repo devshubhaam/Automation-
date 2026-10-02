@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from typing import Optional
 
+from .archive_processor import safe_extract, validate_archive
 from .config import ConfigError, Settings
-from .job_manager import JobManager
+from .job_manager import JobManager, JobStatus
 from .login_bot import LoginBot
+from .media_scanner import scan_directory
 from .telegram_client import TelegramUserbot
 
 logger = logging.getLogger("app.main")
 
 
 class PipelineWorker:
-    """Background worker that processes submitted media jobs."""
+    """Background worker for Part 1 archive processing."""
 
     def __init__(
         self,
@@ -31,7 +34,6 @@ class PipelineWorker:
 
     async def submit(self, job) -> None:
         """Submit a job to the processing queue."""
-
         await self._queue.put(job)
 
         logger.info(
@@ -40,8 +42,7 @@ class PipelineWorker:
         )
 
     async def start(self) -> None:
-        """Start configured worker tasks."""
-
+        """Start pipeline workers."""
         self._stopping = False
 
         worker_count = max(
@@ -59,12 +60,10 @@ class PipelineWorker:
                 self._worker_loop(index + 1),
                 name=f"pipeline-worker-{index + 1}",
             )
-
             self._workers.append(task)
 
     async def stop(self) -> None:
-        """Stop all worker tasks."""
-
+        """Stop pipeline workers."""
         self._stopping = True
 
         if not self._workers:
@@ -84,12 +83,8 @@ class PipelineWorker:
 
         logger.info("Pipeline workers stopped")
 
-    async def _worker_loop(
-        self,
-        worker_id: int,
-    ) -> None:
-        """Process jobs continuously."""
-
+    async def _worker_loop(self, worker_id: int) -> None:
+        """Continuously process queued jobs."""
         logger.info(
             "Pipeline worker %s started",
             worker_id,
@@ -126,28 +121,27 @@ class PipelineWorker:
         )
 
     async def _process(self, job) -> None:
-        """Run the Part 1 processing stages for one job."""
-
+        """Run download -> validate -> extract -> scan."""
         job_id = job.job_id
 
         try:
-            await self.job_manager.mark_running(job_id)
-
-            logger.info(
-                "Job %s: processing started",
+            # RECEIVED -> QUEUED is normally done by Telegram handler.
+            # QUEUED -> DOWNLOADING
+            self.job_manager.set_status(
                 job_id,
+                JobStatus.DOWNLOADING,
             )
 
-            # ---------------------------------------------------------- #
-            # DOWNLOADING
-            # ---------------------------------------------------------- #
-
-            await self.job_manager.update_stage(
+            logger.info(
+                "Job %s: downloading archive",
                 job_id,
-                "DOWNLOADING",
             )
 
             archive_path = await self._download(job)
+
+            if job.cancel_requested:
+                self.job_manager.cancel(job_id)
+                return
 
             logger.info(
                 "Job %s: download completed: %s",
@@ -155,74 +149,95 @@ class PipelineWorker:
                 archive_path,
             )
 
-            # ---------------------------------------------------------- #
-            # EXTRACTING
-            # ---------------------------------------------------------- #
-
-            await self.job_manager.update_stage(
-                job_id,
-                "EXTRACTING",
-            )
-
-            extracted_dir = await self._extract(
-                job,
+            # Validate before extraction.
+            archive_info = await asyncio.to_thread(
+                validate_archive,
                 archive_path,
+                self.settings,
+            )
+
+            job.archive_size_bytes = archive_info.archive_size_bytes
+            job.write_metadata()
+
+            if job.cancel_requested:
+                self.job_manager.cancel(job_id)
+                return
+
+            # DOWNLOADING -> EXTRACTING
+            self.job_manager.set_status(
+                job_id,
+                JobStatus.EXTRACTING,
             )
 
             logger.info(
-                "Job %s: extraction completed",
+                "Job %s: extracting archive",
                 job_id,
             )
 
-            # ---------------------------------------------------------- #
-            # SCANNING
-            # ---------------------------------------------------------- #
-
-            await self.job_manager.update_stage(
-                job_id,
-                "SCANNING",
+            extraction_result = await asyncio.to_thread(
+                safe_extract,
+                archive_path,
+                job.extracted_dir,
+                self.settings,
+                should_cancel=lambda: job.cancel_requested,
             )
 
-            result = await self._scan(
-                job,
-                extracted_dir,
+            if job.cancel_requested:
+                self.job_manager.cancel(job_id)
+                return
+
+            logger.info(
+                "Job %s: extracted %s files (%s bytes)",
+                job_id,
+                extraction_result.extracted_files,
+                extraction_result.total_bytes,
+            )
+
+            # EXTRACTING -> SCANNING
+            self.job_manager.set_status(
+                job_id,
+                JobStatus.SCANNING,
             )
 
             logger.info(
-                "Job %s: media scan completed",
+                "Job %s: scanning media",
                 job_id,
             )
 
-            # ---------------------------------------------------------- #
-            # COMPLETED
-            # ---------------------------------------------------------- #
+            result = await asyncio.to_thread(
+                scan_directory,
+                job.extracted_dir,
+            )
 
-            await self.job_manager.mark_completed(
+            if job.cancel_requested:
+                self.job_manager.cancel(job_id)
+                return
+
+            self.job_manager.update_counts(
                 job_id,
-                result,
+                result.counts(),
+            )
+
+            # SCANNING -> COMPLETED
+            self.job_manager.set_status(
+                job_id,
+                JobStatus.COMPLETED,
             )
 
             logger.info(
-                "Job %s: processing completed",
+                "Job %s: processing completed "
+                "(images=%s videos=%s ignored=%s)",
                 job_id,
+                result.image_count,
+                result.video_count,
+                result.ignored_count,
             )
 
         except asyncio.CancelledError:
             logger.info(
-                "Job %s: processing cancelled",
+                "Job %s: worker task cancelled",
                 job_id,
             )
-
-            try:
-                await self.job_manager.mark_cancelled(
-                    job_id,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to mark job %s as cancelled",
-                    job_id,
-                )
-
             raise
 
         except Exception as exc:
@@ -232,10 +247,13 @@ class PipelineWorker:
             )
 
             try:
-                await self.job_manager.mark_failed(
-                    job_id,
-                    type(exc).__name__,
-                )
+                current = self.job_manager.get(job_id)
+
+                if not current.is_terminal:
+                    self.job_manager.fail(
+                        job_id,
+                        f"{type(exc).__name__}: {exc}",
+                    )
             except Exception:
                 logger.exception(
                     "Failed to mark job %s as failed",
@@ -244,21 +262,30 @@ class PipelineWorker:
 
         finally:
             try:
-                await self._cleanup(job)
+                self.job_manager.cleanup_job_files(job_id)
             except Exception:
                 logger.exception(
                     "Job %s: cleanup failed",
                     job_id,
                 )
 
-    # ------------------------------------------------------------------ #
-    # Pipeline stages
-    # ------------------------------------------------------------------ #
-
     async def _download(self, job):
-        """Download the Telegram ZIP archive."""
+        """Download the Telegram document for the job."""
+        if self.settings.keep_job_files:
+            logger.info(
+                "KEEP_JOB_FILES=true for job %s",
+                job.job_id,
+            )
 
-        message = await job.get_message()
+        # The Telegram message itself is not stored in JobManager.
+        # telegram_client attaches the source message object to the job
+        # before submitting it.
+        message = getattr(job, "_telegram_message", None)
+
+        if message is None:
+            raise RuntimeError(
+                "Telegram source message is unavailable for job"
+            )
 
         archive_dir = job.archive_dir
         archive_dir.mkdir(
@@ -266,7 +293,7 @@ class PipelineWorker:
             exist_ok=True,
         )
 
-        archive_path = archive_dir / "archive.zip"
+        archive_path = job.archive_path
 
         downloaded = await message.download_media(
             file=str(archive_path),
@@ -279,76 +306,9 @@ class PipelineWorker:
 
         return archive_path
 
-    async def _extract(
-        self,
-        job,
-        archive_path,
-    ):
-        """Safely extract the ZIP archive."""
-
-        from .archive_processor import ArchiveProcessor
-
-        processor = ArchiveProcessor(
-            settings=self.settings,
-        )
-
-        return await asyncio.to_thread(
-            processor.extract,
-            archive_path,
-            job.extracted_dir,
-        )
-
-    async def _scan(
-        self,
-        job,
-        extracted_dir,
-    ):
-        """Recursively scan extracted files for media."""
-
-        from .media_scanner import MediaScanner
-
-        scanner = MediaScanner()
-
-        result = await asyncio.to_thread(
-            scanner.scan,
-            extracted_dir,
-        )
-
-        return result
-
-    async def _cleanup(self, job) -> None:
-        """Cleanup job files according to KEEP_JOB_FILES."""
-
-        if self.settings.keep_job_files:
-            logger.info(
-                "Job %s: keeping job files",
-                job.job_id,
-            )
-            return
-
-        # Keep metadata, but remove archive/extracted data.
-        for directory in (
-            job.archive_dir,
-            job.extracted_dir,
-        ):
-            if directory.exists():
-                await asyncio.to_thread(
-                    self._remove_directory,
-                    directory,
-                )
-
-    @staticmethod
-    def _remove_directory(directory) -> None:
-        import shutil
-
-        shutil.rmtree(
-            directory,
-            ignore_errors=True,
-        )
-
 
 class Application:
-    """Coordinates the Telegram client, login bot and pipeline."""
+    """Coordinate userbot, login bot and processing pipeline."""
 
     def __init__(
         self,
@@ -365,7 +325,6 @@ class Application:
 
     async def start(self) -> None:
         """Start the complete application."""
-
         logger.info(
             "Starting Telegram Media Processor (PART 1)"
         )
@@ -373,7 +332,8 @@ class Application:
         self.settings.ensure_directories()
 
         self.job_manager = JobManager(
-            self.settings,
+            self.settings.job_dir,
+            keep_files=self.settings.keep_job_files,
         )
 
         self.pipeline = PipelineWorker(
@@ -392,25 +352,16 @@ class Application:
             self.userbot,
         )
 
-        # -------------------------------------------------------------- #
-        # Connect userbot session
-        # -------------------------------------------------------------- #
-
+        # Start userbot connection.
         await self.userbot.start()
 
-        # -------------------------------------------------------------- #
-        # Existing authorized session
-        # -------------------------------------------------------------- #
-
+        # Existing authorized session.
         if await self.userbot.client.is_user_authorized():
             logger.info(
                 "Existing Telegram userbot session is authorized"
             )
 
-        # -------------------------------------------------------------- #
-        # First-time QR login
-        # -------------------------------------------------------------- #
-
+        # First-time QR login.
         else:
             if not self.settings.bot_token:
                 raise ConfigError(
@@ -423,12 +374,8 @@ class Application:
                 )
 
             logger.info(
-                "Telegram userbot is not authorized"
-            )
-
-            logger.info(
-                "Starting login bot; send /login to authorize "
-                "the userbot via QR"
+                "Telegram userbot is not authorized; "
+                "starting QR login bot"
             )
 
             await self.login_bot.start()
@@ -444,10 +391,7 @@ class Application:
                 "QR authentication completed"
             )
 
-        # -------------------------------------------------------------- #
-        # Start processing pipeline
-        # -------------------------------------------------------------- #
-
+        # Start processing workers only after Telegram auth.
         await self.pipeline.start()
 
         logger.info(
@@ -455,19 +399,16 @@ class Application:
         )
 
     async def run(self) -> None:
-        """Run application until shutdown."""
-
+        """Run until shutdown."""
         await self.start()
 
         try:
             await self._stop_event.wait()
-
         finally:
             await self.stop()
 
     async def stop(self) -> None:
-        """Gracefully stop all application components."""
-
+        """Gracefully stop all components."""
         logger.info(
             "Stopping Telegram Media Processor"
         )
@@ -487,23 +428,21 @@ class Application:
 
     def request_stop(self) -> None:
         """Request application shutdown."""
-
         self._stop_event.set()
 
 
 async def async_main() -> None:
-    """Async application entry point."""
-
+    """Async entry point."""
     settings = Settings.from_env()
 
     application = Application(settings)
 
     loop = asyncio.get_running_loop()
 
+    import signal
+
     for signal_name in ("SIGINT", "SIGTERM"):
         try:
-            import signal
-
             signal_value = getattr(
                 signal,
                 signal_name,
@@ -518,7 +457,6 @@ async def async_main() -> None:
             AttributeError,
             NotImplementedError,
         ):
-            # Signal handlers are not available on every platform.
             pass
 
     await application.run()
@@ -526,7 +464,6 @@ async def async_main() -> None:
 
 def main() -> None:
     """Synchronous entry point."""
-
     try:
         asyncio.run(async_main())
 
