@@ -148,47 +148,83 @@ def _get_path(
 class Settings:
     """Immutable application settings."""
 
+    # ----------------------------------------------------------------------- #
     # Telegram API
+    # ----------------------------------------------------------------------- #
+
     api_id: int
     api_hash: str
 
+    # ----------------------------------------------------------------------- #
     # Telegram userbot session
+    # ----------------------------------------------------------------------- #
+
     session_name: str = "media_processor"
     session_dir: Path = Path("./data/sessions")
 
+    # ----------------------------------------------------------------------- #
     # Runtime directories
+    # ----------------------------------------------------------------------- #
+
     download_dir: Path = Path("./data/downloads")
     job_dir: Path = Path("./data/jobs")
     log_dir: Path = Path("./data/logs")
 
+    # ----------------------------------------------------------------------- #
     # Archive limits
+    # ----------------------------------------------------------------------- #
+
     max_archive_size_mb: int = 500
     max_extracted_size_mb: int = 2000
     max_files_per_archive: int = 10000
 
+    # ----------------------------------------------------------------------- #
     # Logging
+    # ----------------------------------------------------------------------- #
+
     log_level: str = "INFO"
     log_max_bytes: int = 5 * 1024 * 1024
     log_backup_count: int = 5
 
+    # ----------------------------------------------------------------------- #
     # Job files
+    # ----------------------------------------------------------------------- #
+
     keep_job_files: bool = False
 
+    # ----------------------------------------------------------------------- #
     # Telegram account
+    # ----------------------------------------------------------------------- #
+
     owner_id: Optional[int] = None
     phone: Optional[str] = None
 
+    # ----------------------------------------------------------------------- #
     # Telegram login bot
+    # ----------------------------------------------------------------------- #
+
     bot_token: Optional[str] = None
     bot_owner_id: Optional[int] = None
 
+    # ----------------------------------------------------------------------- #
     # Pipeline
+    # ----------------------------------------------------------------------- #
+
     worker_count: int = 1
 
+    # ----------------------------------------------------------------------- #
     # MongoDB persistent Telegram session
+    # ----------------------------------------------------------------------- #
+
     mongodb_uri: Optional[str] = None
     mongodb_database: str = "telegram_media_processor"
     mongodb_collection: str = "sessions"
+
+    # ----------------------------------------------------------------------- #
+    # Part 2 - Image hosting
+    # ----------------------------------------------------------------------- #
+
+    imgbb_api_key: Optional[str] = None
 
     # ----------------------------------------------------------------------- #
     # Derived values
@@ -204,7 +240,7 @@ class Settings:
 
     @property
     def session_path(self) -> Path:
-        """Path of the Telethon local session."""
+        """Path of the local Telethon session."""
         return self.session_dir / self.session_name
 
     @property
@@ -252,7 +288,8 @@ class Settings:
             f"bot_owner_id={self.bot_owner_id}, "
             f"worker_count={self.worker_count}, "
             f"mongodb_database={self.mongodb_database!r}, "
-            f"mongodb_collection={self.mongodb_collection!r}"
+            f"mongodb_collection={self.mongodb_collection!r}, "
+            f"imgbb_api_key='***redacted***'"
             f")"
         )
 
@@ -322,7 +359,6 @@ class Settings:
         return cls(
             # Telegram API
             api_id=api_id,
-
             api_hash=api_hash,
 
             # Userbot session
@@ -440,4 +476,14 @@ class Settings:
                 "MONGODB_COLLECTION",
                 default="sessions",
             ) or "sessions",
+
+            # Part 2 - ImgBB
+            #
+            # Optional here so the application can still start without
+            # ImgBB configured. Uploading an image will report a clear
+            # upload error instead of failing application startup.
+            imgbb_api_key=_get_str(
+                "IMGBB_API_KEY",
+                default=None,
+            ),
         )
