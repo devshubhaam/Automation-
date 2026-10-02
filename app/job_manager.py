@@ -1,605 +1,629 @@
-"""Job state and queue management."""
-
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
-import shutil
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Optional
 
-logger = logging.getLogger("app.job_manager")
-
-__all__ = [
-    "Job",
-    "JobManager",
-    "JobStateError",
-    "JobStatus",
-]
-
-
-def _utc_now_iso() -> str:
-    """Return current UTC time as an ISO-8601 string."""
-    return datetime.now(timezone.utc).isoformat()
-
-
-class JobStateError(RuntimeError):
-    """Raised when a job state operation is invalid."""
-
-
-class JobStatus(str, Enum):
-    """Supported job states."""
-
-    RECEIVED = "RECEIVED"
-    QUEUED = "QUEUED"
-    DOWNLOADING = "DOWNLOADING"
-    EXTRACTING = "EXTRACTING"
-    SCANNING = "SCANNING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    CANCELLED = "CANCELLED"
-
-
-TERMINAL_STATUSES = frozenset(
-    {
-        JobStatus.COMPLETED,
-        JobStatus.FAILED,
-        JobStatus.CANCELLED,
-    }
+from .archive_processor import (
+    ArchiveError,
+    extract_archive,
+    validate_archive,
 )
+from .config import settings
+from .job_manager import Job, JobManager, JobStatus
+from .logging_config import setup_logging
+from .media_scanner import scan_directory
+from .telegram_client import TelegramUserbot
+
+try:
+    from .login_bot import LoginBot
+except ImportError:
+    LoginBot = None
 
 
-ALLOWED_TRANSITIONS = {
-    JobStatus.RECEIVED: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.CANCELLED,
-            JobStatus.FAILED,
-        }
-    ),
-    JobStatus.QUEUED: frozenset(
-        {
-            JobStatus.DOWNLOADING,
-            JobStatus.CANCELLED,
-            JobStatus.FAILED,
-        }
-    ),
-    JobStatus.DOWNLOADING: frozenset(
-        {
-            JobStatus.EXTRACTING,
-            JobStatus.CANCELLED,
-            JobStatus.FAILED,
-        }
-    ),
-    JobStatus.EXTRACTING: frozenset(
-        {
-            JobStatus.SCANNING,
-            JobStatus.CANCELLED,
-            JobStatus.FAILED,
-        }
-    ),
-    JobStatus.SCANNING: frozenset(
-        {
-            JobStatus.COMPLETED,
-            JobStatus.CANCELLED,
-            JobStatus.FAILED,
-        }
-    ),
-    JobStatus.COMPLETED: frozenset(),
-    JobStatus.FAILED: frozenset(),
-    JobStatus.CANCELLED: frozenset(),
-}
+logger = logging.getLogger(__name__)
 
 
-def generate_job_id() -> str:
-    """Generate a readable unique job identifier."""
-    timestamp = datetime.now(timezone.utc).strftime(
-        "%Y%m%d-%H%M%S"
-    )
+class HealthServer:
+    """Minimal HTTP health server for Koyeb Web Service."""
 
-    import secrets
+    def __init__(self, host: str = "0.0.0.0", port: int = 8000):
+        self.host = host
+        self.port = port
+        self.server: Optional[asyncio.AbstractServer] = None
 
-    suffix = secrets.token_hex(2).upper()
-
-    return f"JOB-{timestamp}-{suffix}"
-
-
-@dataclass
-class Job:
-    """Represent one media-processing job."""
-
-    job_id: str
-    source_message_id: Optional[int]
-    chat_id: Optional[int]
-    sender_id: Optional[int]
-    archive_name: str
-    archive_size_bytes: int
-    job_directory: Path
-    status: JobStatus = JobStatus.RECEIVED
-
-    created_at: str = field(
-        default_factory=_utc_now_iso
-    )
-    updated_at: str = field(
-        default_factory=_utc_now_iso
-    )
-
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-
-    status_message_id: Optional[int] = None
-
-    total_files: int = 0
-    image_files: int = 0
-    video_files: int = 0
-    ignored_files: int = 0
-
-    error: Optional[str] = None
-    cancel_requested: bool = False
-
-    @property
-    def archive_dir(self) -> Path:
-        """Return directory containing the downloaded archive."""
-        return self.job_directory / "archive"
-
-    @property
-    def archive_path(self) -> Path:
-        """Return expected archive path."""
-        return self.archive_dir / self.archive_name
-
-    @property
-    def extracted_dir(self) -> Path:
-        """Return extraction directory."""
-        return self.job_directory / "extracted"
-
-    @property
-    def metadata_path(self) -> Path:
-        """Return metadata file path."""
-        return self.job_directory / "job.json"
-
-    @property
-    def is_terminal(self) -> bool:
-        """Return whether this job has reached a terminal state."""
-        return self.status in TERMINAL_STATUSES
-
-    def to_dict(self) -> dict:
-        """Serialize job metadata."""
-        return {
-            "job_id": self.job_id,
-            "source_message_id": self.source_message_id,
-            "chat_id": self.chat_id,
-            "sender_id": self.sender_id,
-            "archive_name": self.archive_name,
-            "archive_size_bytes": self.archive_size_bytes,
-            "job_directory": str(self.job_directory),
-            "status": self.status.value,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "status_message_id": self.status_message_id,
-            "total_files": self.total_files,
-            "image_files": self.image_files,
-            "video_files": self.video_files,
-            "ignored_files": self.ignored_files,
-            "error": self.error,
-            "cancel_requested": self.cancel_requested,
-        }
-
-    def write_metadata(self) -> None:
-        """Persist job metadata to disk."""
-        self.job_directory.mkdir(
-            parents=True,
-            exist_ok=True,
+    async def start(self) -> None:
+        self.server = await asyncio.start_server(
+            self._handle_client,
+            self.host,
+            self.port,
         )
 
-        temporary_path = self.metadata_path.with_suffix(
-            ".json.tmp"
+        logger.info(
+            "Health server listening on %s:%s",
+            self.host,
+            self.port,
         )
 
-        temporary_path.write_text(
-            json.dumps(
-                self.to_dict(),
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            await reader.read(4096)
 
-        temporary_path.replace(self.metadata_path)
+            response_body = b"OK\n"
+
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Content-Length: "
+                + str(len(response_body)).encode()
+                + b"\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+                + response_body
+            )
+
+            writer.write(response)
+            await writer.drain()
+
+        except Exception:
+            logger.exception("Health server request failed")
+
+        finally:
+            writer.close()
+
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def stop(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
 
 
-class JobManager:
-    """Manage jobs and their pending queue."""
+class PipelineWorker:
+    """
+    Background worker responsible for processing ZIP jobs.
+
+    Pipeline:
+        QUEUED
+          ↓
+        DOWNLOADING
+          ↓
+        EXTRACTING
+          ↓
+        SCANNING
+          ↓
+        COMPLETED
+    """
 
     def __init__(
         self,
-        base_dir: Path,
-        *,
-        keep_files: bool = False,
-    ) -> None:
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.keep_files = keep_files
-
-        self._jobs: Dict[str, Job] = {}
-        self._queue: List[str] = []
-
-    # -- creation ----------------------------------------------------------- #
-
-    def create_job(
-        self,
-        *,
-        archive_name: str,
-        source_message_id: Optional[int] = None,
-        chat_id: Optional[int] = None,
-        sender_id: Optional[int] = None,
-        archive_size_bytes: int = 0,
-    ) -> Job:
-        """Create and register a new job."""
-        job_id = generate_job_id()
-
-        while job_id in self._jobs:
-            job_id = generate_job_id()
-
-        job_directory = self.base_dir / job_id
-
-        (
-            job_directory / "archive"
-        ).mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        (
-            job_directory / "extracted"
-        ).mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        job = Job(
-            job_id=job_id,
-            source_message_id=source_message_id,
-            chat_id=chat_id,
-            sender_id=sender_id,
-            archive_name=Path(
-                archive_name or "archive.zip"
-            ).name,
-            archive_size_bytes=archive_size_bytes,
-            job_directory=job_directory,
-            status=JobStatus.RECEIVED,
-        )
-
-        self._jobs[job_id] = job
-
-        job.write_metadata()
-
-        logger.info(
-            "Created job %s (archive=%s)",
-            job_id,
-            job.archive_name,
-        )
-
-        return job
-
-    # -- access ------------------------------------------------------------- #
-
-    def get(self, job_id: str) -> Job:
-        """Return a job or raise if it does not exist."""
-        try:
-            return self._jobs[job_id]
-
-        except KeyError as exc:
-            raise JobStateError(
-                f"unknown job id: {job_id}"
-            ) from exc
-
-    def find(self, job_id: str) -> Optional[Job]:
-        """Return a job or None."""
-        return self._jobs.get(job_id)
-
-    def all_jobs(self) -> List[Job]:
-        """Return all jobs ordered by creation time."""
-        return sorted(
-            self._jobs.values(),
-            key=lambda job: job.created_at,
-        )
-
-    def __iter__(self) -> Iterator[Job]:
-        return iter(self.all_jobs())
-
-    def __len__(self) -> int:
-        return len(self._jobs)
-
-    def active_jobs(self) -> List[Job]:
-        """Return all non-terminal jobs."""
-        return [
-            job
-            for job in self.all_jobs()
-            if not job.is_terminal
-        ]
-
-    def active_job(self) -> Optional[Job]:
-        """Return the newest active job."""
-        for job in reversed(self.all_jobs()):
-            if not job.is_terminal:
-                return job
-
-        return None
-
-    def latest_job(self) -> Optional[Job]:
-        """Return the newest job."""
-        jobs = self.all_jobs()
-
-        return jobs[-1] if jobs else None
-
-    # -- state machine ------------------------------------------------------ #
-
-    def can_transition(
-        self,
-        current: JobStatus,
-        new: JobStatus,
-    ) -> bool:
-        """Check whether a state transition is allowed."""
-        return new in ALLOWED_TRANSITIONS.get(
-            current,
-            frozenset(),
-        )
-
-    def set_status(
-        self,
-        job_id: str,
-        new_status: JobStatus,
-        *,
-        error: Optional[str] = None,
-    ) -> Job:
-        """Change a job's status."""
-        job = self.get(job_id)
-
-        new_status = JobStatus(new_status)
-
-        if new_status == job.status:
-            job.updated_at = _utc_now_iso()
-            return job
-
-        if not self.can_transition(
-            job.status,
-            new_status,
-        ):
-            raise JobStateError(
-                f"illegal transition for {job_id}: "
-                f"{job.status.value} -> {new_status.value}"
-            )
-
-        previous = job.status
-
-        job.status = new_status
-        job.updated_at = _utc_now_iso()
-
-        if (
-            new_status == JobStatus.DOWNLOADING
-            and job.started_at is None
-        ):
-            job.started_at = job.updated_at
-
-        if new_status in TERMINAL_STATUSES:
-            job.finished_at = job.updated_at
-
-        if error is not None:
-            job.error = error
-
-        job.write_metadata()
-
-        logger.info(
-            "Job %s status %s -> %s",
-            job_id,
-            previous.value,
-            new_status.value,
-        )
-
-        return job
-
-    def fail(
-        self,
-        job_id: str,
-        error: str,
-    ) -> Job:
-        """Mark a job as failed."""
-        return self.set_status(
-            job_id,
-            JobStatus.FAILED,
-            error=error,
-        )
-
-    def cancel(self, job_id: str) -> Job:
-        """Cancel a job immediately."""
-        job = self.get(job_id)
-
-        if job.is_terminal:
-            return job
-
-        return self.set_status(
-            job_id,
-            JobStatus.CANCELLED,
-        )
-
-    def request_cancel(
-        self,
-        job_id: str,
-    ) -> bool:
-        """Request cancellation for a running job."""
-        job = self.find(job_id)
-
-        if job is None or job.is_terminal:
-            return False
-
-        job.cancel_requested = True
-        job.updated_at = _utc_now_iso()
-        job.write_metadata()
-
-        return True
-
-    def update_counts(
-        self,
-        job_id: str,
-        counts: Dict[str, int],
-    ) -> Job:
-        """Update scan counters."""
-        job = self.get(job_id)
-
-        job.total_files = int(
-            counts.get(
-                "total_files",
-                job.total_files,
-            )
-        )
-
-        job.image_files = int(
-            counts.get(
-                "image_files",
-                job.image_files,
-            )
-        )
-
-        job.video_files = int(
-            counts.get(
-                "video_files",
-                job.video_files,
-            )
-        )
-
-        job.ignored_files = int(
-            counts.get(
-                "ignored_files",
-                job.ignored_files,
-            )
-        )
-
-        job.updated_at = _utc_now_iso()
-
-        job.write_metadata()
-
-        return job
-
-    def set_status_message(
-        self,
-        job_id: str,
-        message_id: Optional[int],
-    ) -> Job:
-        """Store Telegram status message ID."""
-        job = self.get(job_id)
-
-        job.status_message_id = message_id
-
-        job.write_metadata()
-
-        return job
-
-    # -- queue -------------------------------------------------------------- #
-
-    def enqueue(self, job_id: str) -> None:
-        """Add a job to the pending queue."""
-        job = self.get(job_id)
-
-        if job.status == JobStatus.RECEIVED:
-            self.set_status(
-                job_id,
-                JobStatus.QUEUED,
-            )
-
-        if job_id not in self._queue:
-            self._queue.append(job_id)
-
-    def dequeue(self) -> Optional[str]:
-        """Remove and return the next non-terminal queued job."""
-        while self._queue:
-            job_id = self._queue.pop(0)
-
-            job = self.find(job_id)
-
-            if job is not None and not job.is_terminal:
-                return job_id
-
-        return None
-
-    def remove_from_queue(
-        self,
-        job_id: str,
-    ) -> None:
-        """Remove a specific job from the pending queue."""
-        try:
-            self._queue.remove(job_id)
-
-        except ValueError:
-            pass
-
-    def queued_jobs(self) -> List[Job]:
-        """Return jobs currently waiting in the queue."""
-        return [
-            self._jobs[job_id]
-            for job_id in self._queue
-            if job_id in self._jobs
-        ]
-
-    def queue_size(self) -> int:
-        """Return number of jobs currently waiting in the queue."""
-        return len(self._queue)
-
-    # -- cleanup ------------------------------------------------------------ #
-
-    def cleanup_job_files(
-        self,
-        job_id: str,
-    ) -> None:
-        """Remove temporary archive/extracted files."""
-        job = self.get(job_id)
-
-        if self.keep_files:
-            logger.info(
-                "Keeping job files for %s",
-                job_id,
-            )
+        job_manager: JobManager,
+        telegram_client: TelegramUserbot,
+    ):
+        self.job_manager = job_manager
+        self.telegram_client = telegram_client
+
+        self._queue: asyncio.Queue[Job] = asyncio.Queue()
+        self._workers: list[asyncio.Task] = []
+
+        self._running = False
+
+    async def start(self, worker_count: int = 1) -> None:
+        if self._running:
             return
 
-        removed = []
+        self._running = True
 
-        for directory in (
-            job.archive_dir,
-            job.extracted_dir,
-        ):
-            if directory.exists():
-                shutil.rmtree(
-                    directory,
-                    ignore_errors=True,
-                )
+        for index in range(worker_count):
+            task = asyncio.create_task(
+                self._worker_loop(index + 1),
+                name=f"pipeline-worker-{index + 1}",
+            )
 
-                removed.append(
-                    directory.name
-                )
+            self._workers.append(task)
 
+            logger.info(
+                "Pipeline worker %s started",
+                index + 1,
+            )
+
+    async def stop(self) -> None:
+        if not self._running:
+            return
+
+        self._running = False
+
+        for task in self._workers:
+            task.cancel()
+
+        if self._workers:
+            await asyncio.gather(
+                *self._workers,
+                return_exceptions=True,
+            )
+
+        self._workers.clear()
+
+        logger.info("Pipeline workers stopped")
+
+    async def submit(self, job: Job) -> None:
+        await self._queue.put(job)
+
+    async def _worker_loop(self, worker_id: int) -> None:
         logger.info(
-            "Cleaned job %s (removed: %s)",
-            job_id,
-            ", ".join(removed) if removed else "nothing",
+            "Pipeline worker %s started",
+            worker_id,
         )
 
-    def forget(self, job_id: str) -> None:
-        """Forget an in-memory job record."""
-        self._queue = [
-            queued_id
-            for queued_id in self._queue
-            if queued_id != job_id
-        ]
+        while self._running:
+            job: Optional[Job] = None
 
-        self._jobs.pop(
-            job_id,
-            None,
+            try:
+                job = await self._queue.get()
+
+                logger.debug(
+                    "Worker %s picked job %s",
+                    worker_id,
+                    job.job_id,
+                )
+
+                await self._process(job)
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                logger.exception(
+                    "Pipeline worker %s failed while processing job",
+                    worker_id,
+                )
+
+            finally:
+                if job is not None:
+                    self._queue.task_done()
+
+    async def _process(self, job: Job) -> None:
+        job_id = job.job_id
+
+        try:
+            # ---------------------------------------------------------
+            # Cancellation check
+            # ---------------------------------------------------------
+            if self.job_manager.is_cancelled(job_id):
+                logger.info(
+                    "Job %s cancelled before processing",
+                    job_id,
+                )
+
+                self.job_manager.update_status(
+                    job_id,
+                    JobStatus.CANCELLED,
+                )
+
+                return
+
+            # ---------------------------------------------------------
+            # DOWNLOAD
+            # ---------------------------------------------------------
+            self.job_manager.update_status(
+                job_id,
+                JobStatus.DOWNLOADING,
+            )
+
+            logger.info(
+                "Job %s: downloading archive",
+                job_id,
+            )
+
+            archive_path = await self._download(job)
+
+            logger.info(
+                "Job %s: download completed: %s",
+                job_id,
+                archive_path,
+            )
+
+            # ---------------------------------------------------------
+            # Validate downloaded archive
+            # ---------------------------------------------------------
+            validate_archive(
+                archive_path,
+                max_archive_size_mb=settings.max_archive_size_mb,
+                max_files=settings.max_files_per_archive,
+            )
+
+            # ---------------------------------------------------------
+            # Cancellation check
+            # ---------------------------------------------------------
+            if self.job_manager.is_cancelled(job_id):
+                logger.info(
+                    "Job %s cancelled after download",
+                    job_id,
+                )
+
+                self.job_manager.update_status(
+                    job_id,
+                    JobStatus.CANCELLED,
+                )
+
+                return
+
+            # ---------------------------------------------------------
+            # EXTRACT
+            # ---------------------------------------------------------
+            self.job_manager.update_status(
+                job_id,
+                JobStatus.EXTRACTING,
+            )
+
+            logger.info(
+                "Job %s: extracting archive",
+                job_id,
+            )
+
+            extracted_dir, extracted_files, extracted_bytes = (
+                extract_archive(
+                    archive_path,
+                    max_extracted_size_mb=settings.max_extracted_size_mb,
+                    max_files=settings.max_files_per_archive,
+                )
+            )
+
+            logger.info(
+                "Job %s: extracted %s files (%s bytes)",
+                job_id,
+                extracted_files,
+                extracted_bytes,
+            )
+
+            # ---------------------------------------------------------
+            # Cancellation check
+            # ---------------------------------------------------------
+            if self.job_manager.is_cancelled(job_id):
+                logger.info(
+                    "Job %s cancelled after extraction",
+                    job_id,
+                )
+
+                self.job_manager.update_status(
+                    job_id,
+                    JobStatus.CANCELLED,
+                )
+
+                return
+
+            # ---------------------------------------------------------
+            # SCAN
+            # ---------------------------------------------------------
+            self.job_manager.update_status(
+                job_id,
+                JobStatus.SCANNING,
+            )
+
+            logger.info(
+                "Job %s: scanning media",
+                job_id,
+            )
+
+            scan_result = scan_directory(
+                Path(extracted_dir),
+            )
+
+            images = getattr(
+                scan_result,
+                "images",
+                [],
+            )
+
+            videos = getattr(
+                scan_result,
+                "videos",
+                [],
+            )
+
+            ignored = getattr(
+                scan_result,
+                "ignored",
+                [],
+            )
+
+            self.job_manager.update_counts(
+                job_id,
+                images=len(images),
+                videos=len(videos),
+                ignored=len(ignored),
+            )
+
+            # ---------------------------------------------------------
+            # COMPLETED
+            # ---------------------------------------------------------
+            self.job_manager.update_status(
+                job_id,
+                JobStatus.COMPLETED,
+            )
+
+            logger.info(
+                "Job %s: processing completed "
+                "(images=%s videos=%s ignored=%s)",
+                job_id,
+                len(images),
+                len(videos),
+                len(ignored),
+            )
+
+        except asyncio.CancelledError:
+            logger.warning(
+                "Job %s processing task cancelled",
+                job_id,
+            )
+
+            try:
+                self.job_manager.update_status(
+                    job_id,
+                    JobStatus.CANCELLED,
+                )
+            except Exception:
+                logger.exception(
+                    "Job %s: failed to mark CANCELLED",
+                    job_id,
+                )
+
+            raise
+
+        except ArchiveError as exc:
+            logger.warning(
+                "Job %s archive error: %s",
+                job_id,
+                exc,
+            )
+
+            try:
+                self.job_manager.mark_failed(
+                    job_id,
+                    str(exc),
+                )
+            except Exception:
+                logger.exception(
+                    "Job %s: failed to mark archive error",
+                    job_id,
+                )
+
+        except Exception as exc:
+            logger.exception(
+                "Job %s processing failed",
+                job_id,
+            )
+
+            try:
+                self.job_manager.mark_failed(
+                    job_id,
+                    str(exc),
+                )
+            except Exception:
+                logger.exception(
+                    "Job %s: failed to mark FAILED",
+                    job_id,
+                )
+
+        finally:
+            # ---------------------------------------------------------
+            # IMPORTANT QUEUE FIX
+            #
+            # telegram_client.py currently puts the job into
+            # JobManager's queue AND PipelineWorker has its own queue.
+            #
+            # Therefore, when this worker finishes a job, remove ONLY
+            # this specific job from JobManager's pending queue.
+            #
+            # Do NOT call dequeue() here because that could remove
+            # another job waiting behind this one.
+            # ---------------------------------------------------------
+            try:
+                self.job_manager.remove_from_queue(job_id)
+
+            except Exception:
+                logger.exception(
+                    "Job %s: failed to remove from queue",
+                    job_id,
+                )
+
+            # ---------------------------------------------------------
+            # Cleanup downloaded/extracted files
+            # ---------------------------------------------------------
+            try:
+                self.job_manager.cleanup_job_files(job_id)
+
+            except Exception:
+                logger.exception(
+                    "Job %s: cleanup failed",
+                    job_id,
+                )
+
+    async def _download(self, job: Job) -> Path:
+        """
+        Download Telegram document to the job archive directory.
+        """
+
+        job_dir = Path(job.job_dir)
+
+        archive_dir = job_dir / "archive"
+        archive_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        filename = Path(job.filename).name
+
+        archive_path = archive_dir / filename
+
+        await self.telegram_client.download_document(
+            job.message,
+            archive_path,
+        )
+
+        return archive_path
+
+
+async def main() -> None:
+    setup_logging()
+
+    logger.info(
+        "Starting Telegram Media Processor (PART 1)"
+    )
+
+    # -------------------------------------------------------------
+    # Health server
+    # -------------------------------------------------------------
+    health_server = HealthServer(
+        host="0.0.0.0",
+        port=8000,
+    )
+
+    await health_server.start()
+
+    # -------------------------------------------------------------
+    # Job manager
+    # -------------------------------------------------------------
+    job_manager = JobManager()
+
+    # -------------------------------------------------------------
+    # Telegram userbot
+    # -------------------------------------------------------------
+    telegram_client = TelegramUserbot(
+        job_manager=job_manager,
+    )
+
+    logger.info("Telegram client starting")
+
+    await telegram_client.start()
+
+    # -------------------------------------------------------------
+    # Login / QR authentication
+    # -------------------------------------------------------------
+    if not await telegram_client.is_authorized():
+
+        logger.info(
+            "Telegram session is not authorized; "
+            "waiting for QR login"
+        )
+
+        if LoginBot is None:
+            raise RuntimeError(
+                "LoginBot is unavailable but Telegram "
+                "authentication is required"
+            )
+
+        logger.info(
+            "Telegram userbot is not authorized; "
+            "starting QR login bot"
+        )
+
+        login_bot = LoginBot(
+            telegram_client=telegram_client,
+        )
+
+        await login_bot.start()
+
+        try:
+            await login_bot.wait_until_authenticated()
+
+        finally:
+            await login_bot.stop()
+
+        logger.info(
+            "QR authentication completed"
+        )
+
+    # -------------------------------------------------------------
+    # Telegram handlers
+    # -------------------------------------------------------------
+    await telegram_client.register_handlers()
+
+    # -------------------------------------------------------------
+    # Pipeline
+    # -------------------------------------------------------------
+    pipeline = PipelineWorker(
+        job_manager=job_manager,
+        telegram_client=telegram_client,
+    )
+
+    worker_count = max(
+        1,
+        settings.worker_count,
+    )
+
+    logger.info(
+        "Starting %s pipeline worker(s)",
+        worker_count,
+    )
+
+    await pipeline.start(
+        worker_count=worker_count,
+    )
+
+    # Give Telegram client access to pipeline.
+    telegram_client.pipeline = pipeline
+
+    logger.info(
+        "Telegram Media Processor is ready"
+    )
+
+    # -------------------------------------------------------------
+    # Keep application alive
+    # -------------------------------------------------------------
+    try:
+        await asyncio.Event().wait()
+
+    except asyncio.CancelledError:
+        logger.info(
+            "Main application cancelled"
+        )
+
+    finally:
+        logger.info(
+            "Stopping Telegram Media Processor"
+        )
+
+        try:
+            await pipeline.stop()
+        except Exception:
+            logger.exception(
+                "Failed to stop pipeline"
+            )
+
+        try:
+            await telegram_client.stop()
+        except Exception:
+            logger.exception(
+                "Failed to stop Telegram client"
+            )
+
+        try:
+            await health_server.stop()
+        except Exception:
+            logger.exception(
+                "Failed to stop health server"
+            )
+
+        logger.info(
+            "Telegram Media Processor stopped"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logger.info(
+            "Application stopped by user"
         )
