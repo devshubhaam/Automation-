@@ -322,16 +322,18 @@ class LoginBot:
 
             buffer.seek(0)
 
-            await self.client.send_file(
-                event.chat_id,
-                buffer,
-                caption=(
-                    "📱 QR scan karo.\n\n"
-                    "Telegram → Settings → Devices → "
-                    "Link Desktop Device"
-                ),
-            )
+            buffer.name = "telegram_login_qr.png"
 
+await self.client.send_file(
+    event.chat_id,
+    buffer,
+    force_document=False,
+    caption=(
+        "📱 Is QR ko scan karo.\n\n"
+        "Telegram → Settings → Devices → "
+        "Link Desktop Device"
+    ),
+)
             logger.info(
                 "QR login code sent to owner"
             )
