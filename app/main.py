@@ -311,14 +311,21 @@ class PipelineWorker:
                 )
 
         finally:
-            try:
-                self.job_manager.cleanup_job_files(job_id)
-            except Exception:
-                logger.exception(
-                    "Job %s: cleanup failed",
-                    job_id,
-                )
+    try:
+        self.job_manager.remove_from_queue(job_id)
+    except Exception:
+        logger.exception(
+            "Job %s: failed to remove from queue",
+            job_id,
+        )
 
+    try:
+        self.job_manager.cleanup_job_files(job_id)
+    except Exception:
+        logger.exception(
+            "Job %s: cleanup failed",
+            job_id,
+        )
     async def _download(self, job):
         """Download the Telegram document for the job."""
         message = getattr(
