@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 from .job_manager import Job, JobStatus
 
 
 class ProgressRenderer:
-    """Builds compact Telegram-friendly progress messages."""
+    """Build compact Telegram-friendly progress messages."""
 
     STATUS_ICONS = {
         JobStatus.RECEIVED: "📥",
@@ -40,20 +40,38 @@ class ProgressRenderer:
         """Render the current state of a job."""
 
         icon = self.STATUS_ICONS.get(job.status, "ℹ️")
+
         status_text = self.STATUS_TEXT.get(
             job.status,
             str(job.status).replace("_", " ").title(),
         )
 
         lines: list[str] = [
-            f"{icon} <b>Media Processor</b>",
+            "📦 <b>Media Processor</b>",
             "",
             f"<b>Job:</b> <code>{self._escape(job.job_id)}</code>",
             f"<b>File:</b> {self._escape(job.archive_name)}",
-            f"<b>Status:</b> {status_text}",
+            f"<b>Status:</b> {icon} {status_text}",
         ]
 
-        if job.status == JobStatus.DOWNLOADING:
+        if job.status == JobStatus.RECEIVED:
+            lines.extend(
+                [
+                    "",
+                    "📥 ZIP received.",
+                    "Preparing job...",
+                ]
+            )
+
+        elif job.status == JobStatus.QUEUED:
+            lines.extend(
+                [
+                    "",
+                    "⏳ Job added to processing queue...",
+                ]
+            )
+
+        elif job.status == JobStatus.DOWNLOADING:
             lines.extend(
                 [
                     "",
@@ -90,7 +108,10 @@ class ProgressRenderer:
             lines.extend(
                 [
                     "",
-                    f"❌ <b>Error:</b> {self._escape(job.error or 'Unknown error')}",
+                    "❌ <b>Processing failed.</b>",
+                    "",
+                    f"<b>Error:</b> "
+                    f"{self._escape(job.error or 'Unknown error')}",
                 ]
             )
 
@@ -102,42 +123,77 @@ class ProgressRenderer:
                 ]
             )
 
-        # Media summary is useful once scanning has happened.
         if self._has_media_stats(job):
             lines.extend(self._render_media_summary(job))
 
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # UPLOADING
+    # ------------------------------------------------------------------
+
     def _render_uploading(self, job: Job) -> list[str]:
+        """Render image-upload progress.
+
+        Videos are intentionally NOT uploaded to ImgBB/Telegraph.
+        They are reserved for Part 3 video-bot processing.
+        """
+
         lines: list[str] = [
             "",
-            "☁️ <b>Uploading detected images...</b>",
+            "☁️ <b>Uploading images...</b>",
         ]
 
-        image_count = int(getattr(job, "image_count", 0) or 0)
-        video_count = int(getattr(job, "video_count", 0) or 0)
+        image_count = self._int_value(job, "image_count")
+        video_count = self._int_value(job, "video_count")
 
-        upload_results = list(getattr(job, "upload_results", []) or [])
-        upload_failures = list(getattr(job, "upload_failures", []) or [])
+        results = list(
+            getattr(job, "upload_results", []) or []
+        )
 
-        successful_images = self._count_successful_image_uploads(
-            upload_results
+        failures = list(
+            getattr(job, "upload_failures", []) or []
+        )
+
+        successful_images = self._count_successful_images(
+            results
+        )
+
+        failed_images = self._count_failed_images(
+            failures
         )
 
         if image_count:
-            lines.append(
-                f"🖼️ Images: {successful_images}/{image_count}"
+            completed_images = min(
+                successful_images + failed_images,
+                image_count,
             )
+
+            lines.append(
+                f"🖼️ Images: "
+                f"{completed_images}/{image_count}"
+            )
+
+            if successful_images:
+                lines.append(
+                    f"✅ Successful image uploads: "
+                    f"{successful_images}"
+                )
+
+            if failed_images:
+                lines.append(
+                    f"❌ Failed image uploads: "
+                    f"{failed_images}"
+                )
 
         if video_count:
-            lines.append(
-                f"🎬 Videos: {video_count} "
-                "(queued for Part 3)"
-            )
-
-        if upload_failures:
-            lines.append(
-                f"⚠️ Upload failures: {len(upload_failures)}"
+            lines.extend(
+                [
+                    "",
+                    f"🎬 Videos detected: {video_count}",
+                    "⏳ Videos will be processed by "
+                    "the target Telegram bot in Part 3.",
+                ]
             )
 
         if image_count == 0 and video_count == 0:
@@ -145,70 +201,118 @@ class ProgressRenderer:
 
         return lines
 
+    # ------------------------------------------------------------------
+    # COMPLETED
+    # ------------------------------------------------------------------
+
     def _render_completed(self, job: Job) -> list[str]:
         lines: list[str] = [
             "",
             "🎉 <b>Processing completed successfully.</b>",
         ]
 
-        upload_results = list(getattr(job, "upload_results", []) or [])
+        results = list(
+            getattr(job, "upload_results", []) or []
+        )
 
-        if upload_results:
+        if results:
             lines.extend(
                 [
                     "",
-                    "🔗 <b>Generated links:</b>",
+                    "🔗 <b>Generated image links:</b>",
                 ]
             )
 
-            lines.extend(self._render_upload_results(upload_results))
+            lines.extend(
+                self._render_upload_results(results)
+            )
 
-        video_count = int(getattr(job, "video_count", 0) or 0)
+        video_count = self._int_value(
+            job,
+            "video_count",
+        )
 
         if video_count:
             lines.extend(
                 [
                     "",
-                    f"🎬 Videos detected: {video_count}",
-                    "⏳ Video bot processing will be handled in Part 3.",
+                    f"🎬 <b>Videos detected:</b> {video_count}",
+                    "⏳ Video processing will be handled "
+                    "by the target bot in Part 3.",
                 ]
             )
 
         return lines
 
-    def _render_completed_with_errors(self, job: Job) -> list[str]:
+    # ------------------------------------------------------------------
+    # COMPLETED WITH ERRORS
+    # ------------------------------------------------------------------
+
+    def _render_completed_with_errors(
+        self,
+        job: Job,
+    ) -> list[str]:
         lines: list[str] = [
             "",
             "⚠️ <b>Processing completed with some errors.</b>",
         ]
 
-        upload_results = list(getattr(job, "upload_results", []) or [])
-        upload_failures = list(getattr(job, "upload_failures", []) or [])
+        results = list(
+            getattr(job, "upload_results", []) or []
+        )
 
-        if upload_results:
+        failures = list(
+            getattr(job, "upload_failures", []) or []
+        )
+
+        if results:
             lines.extend(
                 [
                     "",
                     "🔗 <b>Successful uploads:</b>",
                 ]
             )
-            lines.extend(self._render_upload_results(upload_results))
 
-        if upload_failures:
+            lines.extend(
+                self._render_upload_results(results)
+            )
+
+        if failures:
             lines.extend(
                 [
                     "",
                     "❌ <b>Failed uploads:</b>",
                 ]
             )
-            lines.extend(self._render_upload_failures(upload_failures))
+
+            lines.extend(
+                self._render_upload_failures(failures)
+            )
 
         return lines
 
-    def _render_media_summary(self, job: Job) -> list[str]:
-        image_count = int(getattr(job, "image_count", 0) or 0)
-        video_count = int(getattr(job, "video_count", 0) or 0)
-        ignored_count = int(getattr(job, "ignored_count", 0) or 0)
+    # ------------------------------------------------------------------
+    # MEDIA SUMMARY
+    # ------------------------------------------------------------------
+
+    def _render_media_summary(
+        self,
+        job: Job,
+    ) -> list[str]:
+        image_count = self._int_value(
+            job,
+            "image_count",
+        )
+
+        video_count = self._int_value(
+            job,
+            "video_count",
+        )
+
+        ignored_count = self._int_value(
+            job,
+            "ignored_count",
+        )
 
         lines = [
             "",
@@ -218,9 +322,15 @@ class ProgressRenderer:
         ]
 
         if ignored_count:
-            lines.append(f"⏭️ Ignored: {ignored_count}")
+            lines.append(
+                f"⏭️ Ignored: {ignored_count}"
+            )
 
         return lines
+
+    # ------------------------------------------------------------------
+    # RESULTS
+    # ------------------------------------------------------------------
 
     def _render_upload_results(
         self,
@@ -229,25 +339,45 @@ class ProgressRenderer:
         lines: list[str] = []
 
         for result in results:
-            provider = self._get_value(result, "provider", "unknown")
-            url = self._get_value(result, "url", "")
-            display_url = self._get_value(result, "display_url", "")
-            filename = self._get_value(result, "filename", "")
-            path = self._get_value(result, "path", "")
+            provider = self._get_value(
+                result,
+                "provider",
+                "unknown",
+            )
+
+            url = self._get_value(
+                result,
+                "url",
+                "",
+            )
+
+            display_url = self._get_value(
+                result,
+                "display_url",
+                "",
+            )
+
+            filename = self._get_value(
+                result,
+                "filename",
+                "",
+            )
+
+            path = self._get_value(
+                result,
+                "path",
+                "",
+            )
 
             label = filename or path or "Media"
 
-            if url:
+            final_url = url or display_url
+
+            if final_url:
                 lines.append(
                     f"• <b>{self._escape(str(label))}</b> "
                     f"({self._escape(str(provider))})\n"
-                    f"  {self._escape(str(url))}"
-                )
-            elif display_url:
-                lines.append(
-                    f"• <b>{self._escape(str(label))}</b> "
-                    f"({self._escape(str(provider))})\n"
-                    f"  {self._escape(str(display_url))}"
+                    f"  {self._escape(str(final_url))}"
                 )
             else:
                 lines.append(
@@ -256,6 +386,10 @@ class ProgressRenderer:
                 )
 
         return lines
+
+    # ------------------------------------------------------------------
+    # FAILURES
+    # ------------------------------------------------------------------
 
     def _render_upload_failures(
         self,
@@ -294,41 +428,159 @@ class ProgressRenderer:
                 f"• <b>{self._escape(str(label))}</b> "
                 f"({self._escape(str(provider))})"
             )
+
             lines.append(
                 f"  ❌ {self._escape(str(error))}"
             )
 
         return lines
 
+    # ------------------------------------------------------------------
+    # COUNTING
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _count_successful_image_uploads(
+    def _count_successful_images(
         results: Iterable[Any],
     ) -> int:
-        """Count unique image/provider uploads.
+        """Count unique images with at least one successful upload.
 
-        An image can have two successful provider uploads
-        (ImgBB + Telegraph), so this method counts the number
-        of result entries conservatively rather than assuming
-        one result equals one image.
+        One image can produce:
+            ImgBB result
+            Telegraph result
+
+        Therefore provider-result count must NOT be used
+        directly as the image count.
         """
 
-        return sum(
-            1
-            for result in results
-            if str(
+        image_keys: set[str] = set()
+
+        for result in results:
+            provider = str(
                 ProgressRenderer._get_value(
                     result,
                     "provider",
                     "",
                 )
             ).lower()
-            in {"imgbb", "telegraph"}
-        )
+
+            if provider not in {
+                "imgbb",
+                "telegraph",
+            }:
+                continue
+
+            filename = str(
+                ProgressRenderer._get_value(
+                    result,
+                    "filename",
+                    "",
+                )
+                or ""
+            )
+
+            path = str(
+                ProgressRenderer._get_value(
+                    result,
+                    "path",
+                    "",
+                )
+                or ""
+            )
+
+            # Prefer filename/path as the identity.
+            # Fall back to URL if needed.
+            key = (
+                filename
+                or path
+                or str(
+                    ProgressRenderer._get_value(
+                        result,
+                        "url",
+                        "",
+                    )
+                    or ""
+                )
+            )
+
+            if key:
+                image_keys.add(key)
+
+        return len(image_keys)
 
     @staticmethod
-    def _has_media_stats(job: Job) -> bool:
+    def _count_failed_images(
+        failures: Iterable[Any],
+    ) -> int:
+        """Count unique failed image files."""
+
+        image_keys: set[str] = set()
+
+        for failure in failures:
+            provider = str(
+                ProgressRenderer._get_value(
+                    failure,
+                    "provider",
+                    "",
+                )
+            ).lower()
+
+            if provider not in {
+                "imgbb",
+                "telegraph",
+            }:
+                continue
+
+            filename = str(
+                ProgressRenderer._get_value(
+                    failure,
+                    "filename",
+                    "",
+                )
+                or ""
+            )
+
+            path = str(
+                ProgressRenderer._get_value(
+                    failure,
+                    "path",
+                    "",
+                )
+                or ""
+            )
+
+            key = filename or path
+
+            if key:
+                image_keys.add(key)
+
+        return len(image_keys)
+
+    # ------------------------------------------------------------------
+    # HELPERS
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _int_value(
+        job: Job,
+        field: str,
+    ) -> int:
+        try:
+            return int(
+                getattr(job, field, 0) or 0
+            )
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _has_media_stats(
+        job: Job,
+    ) -> bool:
         return any(
-            int(getattr(job, field, 0) or 0) > 0
+            ProgressRenderer._int_value(
+                job,
+                field,
+            ) > 0
             for field in (
                 "image_count",
                 "video_count",
@@ -342,16 +594,22 @@ class ProgressRenderer:
         key: str,
         default: Any = None,
     ) -> Any:
-        """Read a value from either a dataclass/object or dict."""
+        """Read value from dataclass/object or dictionary."""
 
         if isinstance(obj, dict):
             return obj.get(key, default)
 
-        return getattr(obj, key, default)
+        return getattr(
+            obj,
+            key,
+            default,
+        )
 
     @staticmethod
-    def _escape(value: str) -> str:
-        """Escape HTML-sensitive characters for Telegram HTML mode."""
+    def _escape(
+        value: str,
+    ) -> str:
+        """Escape HTML-sensitive characters."""
 
         return (
             str(value)
@@ -361,23 +619,26 @@ class ProgressRenderer:
         )
 
 
-# Backwards-compatible helper.
+# ----------------------------------------------------------------------
+# Backwards-compatible helpers
+# ----------------------------------------------------------------------
+
 _default_renderer = ProgressRenderer()
 
 
 def render_progress(job: Job) -> str:
-    """Render a job using the default progress renderer."""
+    """Render a job using the default renderer."""
 
     return _default_renderer.render(job)
 
 
 def format_progress(job: Job) -> str:
-    """Alias kept for callers using the older function name."""
+    """Compatibility alias."""
 
     return _default_renderer.render(job)
 
 
 def build_progress_message(job: Job) -> str:
-    """Alias for compatibility with older pipeline code."""
+    """Compatibility alias."""
 
     return _default_renderer.render(job)
