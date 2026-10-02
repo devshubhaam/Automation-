@@ -8,7 +8,11 @@ import signal
 from pathlib import Path
 from typing import Any
 
-from .archive_processor import safe_extract, validate_archive
+from .archive_processor import (
+    ExtractionCancelledError,
+    safe_extract,
+    validate_archive,
+)
 from .config import ConfigError, Settings
 from .job_manager import (
     Job,
@@ -22,15 +26,25 @@ from .login_bot import LoginBot
 from .media_scanner import scan_directory
 from .progress import ProgressRenderer
 from .telegram_client import TelegramUserbot
-from .uploaders.imgbb import (
+from .uploaders import (
+    PART2_IMAGE_MAX_BYTES,
     ImgBBUploader,
-    UploadError as ImgBBUploadError,
+    TelegraphUploader,
+    UploadError,
 )
 
 logger = logging.getLogger("app.main")
 
 HEALTH_HOST = "0.0.0.0"
 HEALTH_PORT = 8000
+
+
+class JobCancelled(Exception):
+    """Raised inside the worker when a job's cancellation was requested.
+
+    Deliberately NOT ``asyncio.CancelledError``: that would tear down the
+    worker task itself instead of just stopping one job.
+    """
 
 
 # ============================================================================
@@ -86,18 +100,26 @@ class PipelineWorker:
         self,
         settings: Settings,
         job_manager: JobManager,
+        *,
+        imgbb_uploader: Any = None,
+        telegraph_uploader: Any = None,
     ) -> None:
         self.settings = settings
         self.job_manager = job_manager
 
+        # The PipelineWorker queue is the ONLY processing queue.
         self._queue: asyncio.Queue[Job] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._stopping = False
 
         self.progress = ProgressRenderer()
 
-        self.imgbb_uploader = ImgBBUploader(
+        # Image-only providers (Part 2). Videos must never reach these.
+        self.imgbb_uploader = imgbb_uploader or ImgBBUploader(
             api_key=settings.imgbb_api_key,
+        )
+        self.telegraph_uploader = (
+            telegraph_uploader or TelegraphUploader()
         )
 
     # ------------------------------------------------------------------
@@ -121,6 +143,11 @@ class PipelineWorker:
             "Job submitted to pipeline: %s",
             job.job_id,
         )
+
+    def queue_size(self) -> int:
+        """Number of jobs waiting in the real processing queue."""
+
+        return self._queue.qsize()
 
     async def start(self) -> None:
         """Start pipeline workers."""
@@ -225,49 +252,49 @@ class PipelineWorker:
     # PROCESS
     # ------------------------------------------------------------------
 
+    def _checkpoint(self, job: Job) -> None:
+        """Raise JobCancelled if cancellation was requested for ``job``."""
+
+        if job.cancel_requested:
+            raise JobCancelled()
+
     async def _process(
         self,
         job: Job,
     ) -> None:
-        """Run the complete Part 2 processing pipeline."""
+        """Run the Part 1 + Part 2 pipeline for one job."""
 
         job_id = job.job_id
+
+        if job.is_terminal():
+            logger.info(
+                "Job %s is already %s; skipping",
+                job_id,
+                job.status,
+            )
+            return
 
         try:
             # ==========================================================
             # DOWNLOAD
             # ==========================================================
 
-            self.job_manager.set_status(
-                job_id,
-                JobStatus.DOWNLOADING,
-            )
+            # Covers jobs cancelled while waiting in the queue: they are
+            # never downloaded, extracted or uploaded.
+            self._checkpoint(job)
 
+            self.job_manager.set_status(job_id, JobStatus.DOWNLOADING)
             await self._notify(job)
 
-            logger.info(
-                "Job %s: downloading archive",
-                job_id,
-            )
-
+            logger.info("Job %s: downloading archive", job_id)
             archive_path = await self._download(job)
+            logger.info("Job %s: download completed", job_id)
 
-            logger.info(
-                "Job %s: download completed: %s",
-                job_id,
-                archive_path,
-            )
+            self._checkpoint(job)  # after download
 
             # ==========================================================
             # VALIDATE
             # ==========================================================
-
-            await self._notify(job)
-
-            logger.info(
-                "Job %s: validating archive",
-                job_id,
-            )
 
             archive_info = await asyncio.to_thread(
                 validate_archive,
@@ -275,56 +302,34 @@ class PipelineWorker:
                 self.settings,
             )
 
-            self.job_manager.set_metadata(
+            self.job_manager.update_metadata(
                 job_id,
-                "archive_size_bytes",
-                archive_info.archive_size_bytes,
-            )
-
-            self.job_manager.set_metadata(
-                job_id,
-                "archive_member_count",
-                archive_info.member_count,
-            )
-
-            self.job_manager.set_metadata(
-                job_id,
-                "archive_file_count",
-                archive_info.file_count,
-            )
-
-            self.job_manager.set_metadata(
-                job_id,
-                "archive_compression_ratio",
-                archive_info.compression_ratio,
+                {
+                    "archive_size_bytes": archive_info.archive_size_bytes,
+                    "archive_member_count": archive_info.member_count,
+                    "archive_file_count": archive_info.file_count,
+                    "archive_compression_ratio": archive_info.compression_ratio,
+                },
             )
 
             # ==========================================================
             # EXTRACT
             # ==========================================================
 
-            self.job_manager.set_status(
-                job_id,
-                JobStatus.EXTRACTING,
-            )
-
+            self.job_manager.set_status(job_id, JobStatus.EXTRACTING)
             await self._notify(job)
 
-            logger.info(
-                "Job %s: extracting archive",
-                job_id,
-            )
-
             if not job.extract_dir:
-                raise RuntimeError(
-                    "Job extract directory is not configured"
-                )
+                raise RuntimeError("Job extract directory is not configured")
+
+            logger.info("Job %s: extracting archive", job_id)
 
             extraction_result = await asyncio.to_thread(
                 safe_extract,
                 archive_path,
                 Path(job.extract_dir),
                 self.settings,
+                should_cancel=lambda: job.cancel_requested,
             )
 
             self.job_manager.set_extraction_stats(
@@ -333,28 +338,16 @@ class PipelineWorker:
                 total_size_bytes=extraction_result.total_bytes,
             )
 
-            logger.info(
-                "Job %s: extracted %s files (%s bytes)",
-                job_id,
-                extraction_result.extracted_files,
-                extraction_result.total_bytes,
-            )
+            self._checkpoint(job)  # after extraction
 
             # ==========================================================
             # SCAN
             # ==========================================================
 
-            self.job_manager.set_status(
-                job_id,
-                JobStatus.SCANNING,
-            )
-
+            self.job_manager.set_status(job_id, JobStatus.SCANNING)
             await self._notify(job)
 
-            logger.info(
-                "Job %s: scanning media",
-                job_id,
-            )
+            logger.info("Job %s: scanning media", job_id)
 
             scan_result = await asyncio.to_thread(
                 scan_directory,
@@ -368,83 +361,42 @@ class PipelineWorker:
                 ignored_count=scan_result.ignored_count,
             )
 
+            self.job_manager.update_metadata(
+                job_id,
+                {
+                    "scan_counts": scan_result.counts(),
+                    "detected_images": [m.to_dict() for m in scan_result.images],
+                    "detected_videos": [m.to_dict() for m in scan_result.videos],
+                },
+            )
+
             logger.info(
-                "Job %s: scan completed "
-                "(images=%s videos=%s ignored=%s)",
+                "Job %s: scan completed (images=%s videos=%s ignored=%s)",
                 job_id,
                 scan_result.image_count,
                 scan_result.video_count,
                 scan_result.ignored_count,
             )
 
-            self.job_manager.set_metadata(
-                job_id,
-                "scan_counts",
-                scan_result.counts(),
-            )
-
-            self.job_manager.set_metadata(
-                job_id,
-                "detected_images",
-                [
-                    media.to_dict()
-                    for media in scan_result.images
-                ],
-            )
-
-            self.job_manager.set_metadata(
-                job_id,
-                "detected_videos",
-                [
-                    media.to_dict()
-                    for media in scan_result.videos
-                ],
-            )
+            self._checkpoint(job)  # after scan
 
             # ==========================================================
-            # IMAGE UPLOAD
-            # ==========================================================
-
-            if scan_result.image_count > 0:
-                self.job_manager.set_status(
-                    job_id,
-                    JobStatus.UPLOADING,
-                )
-
-                await self._notify(job)
-
-                await self._upload_images(
-                    job,
-                    scan_result.images,
-                )
-
-            # ==========================================================
-            # VIDEO — PART 3
+            # VIDEOS — reserved for Part 3. Never sent to ImgBB/Telegraph.
             # ==========================================================
 
             if scan_result.video_count > 0:
+                self.job_manager.update_metadata(
+                    job_id,
+                    {
+                        "video_processing": "pending_part3",
+                        "video_files": [m.to_dict() for m in scan_result.videos],
+                    },
+                )
                 logger.info(
-                    "Job %s: detected %s video(s); "
-                    "video-bot processing reserved for Part 3",
+                    "Job %s: %s video(s) reserved for Part 3",
                     job_id,
                     scan_result.video_count,
                 )
-
-                self.job_manager.set_metadata(
-                    job_id,
-                    "video_processing",
-                    "pending_part3",
-                )
-
-                self.job_manager.set_metadata(
-                    job_id,
-                    "video_files",
-                    [
-                        media.to_dict()
-                        for media in scan_result.videos
-                    ],
-                )
-
             else:
                 self.job_manager.set_metadata(
                     job_id,
@@ -453,17 +405,21 @@ class PipelineWorker:
                 )
 
             # ==========================================================
+            # IMAGES — Part 2
+            # ==========================================================
+
+            await self._upload_images(job, scan_result.images)
+
+            # ==========================================================
             # FINAL STATUS
             # ==========================================================
 
+            self._checkpoint(job)  # before final completion
+
             if job.upload_failures:
-                self.job_manager.complete_with_errors(
-                    job_id,
-                )
+                self.job_manager.complete_with_errors(job_id)
             else:
-                self.job_manager.complete(
-                    job_id,
-                )
+                self.job_manager.complete(job_id)
 
             await self._notify(job)
 
@@ -473,34 +429,27 @@ class PipelineWorker:
                 job.status,
             )
 
+        except (JobCancelled, ExtractionCancelledError):
+            self.job_manager.mark_cancelled(job_id)
+            logger.info("Job %s: stopped after cancellation request", job_id)
+            await self._notify(job)
+
         except asyncio.CancelledError:
-            logger.info(
-                "Job %s: processing task cancelled",
-                job_id,
-            )
+            logger.info("Job %s: processing task cancelled", job_id)
             raise
 
         except Exception as exc:
-            logger.exception(
-                "Job %s: processing failed",
-                job_id,
-            )
+            logger.exception("Job %s: processing failed", job_id)
 
             try:
-                current_job = self.job_manager.require_job(
-                    job_id,
-                )
-
-                if not current_job.is_terminal():
+                if not job.is_terminal():
                     self.job_manager.set_error(
                         job_id,
                         f"{type(exc).__name__}: {exc}",
                         failed=True,
                     )
 
-                await self._notify(
-                    current_job,
-                )
+                await self._notify(job)
 
             except Exception:
                 logger.exception(
@@ -509,14 +458,8 @@ class PipelineWorker:
                 )
 
         finally:
-            self.job_manager.remove_from_queue(
-                job_id,
-            )
-
             if not self.settings.keep_job_files:
-                self.job_manager.cleanup_job_files(
-                    job_id,
-                )
+                self.job_manager.cleanup_job_files(job_id)
 
     # ------------------------------------------------------------------
     # DOWNLOAD
@@ -574,126 +517,180 @@ class PipelineWorker:
         return downloaded_path
 
     # ------------------------------------------------------------------
-    # IMAGE UPLOAD
+    # IMAGE UPLOAD (Part 2: images only)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _skipped_entry(media: Any, size: int) -> dict[str, Any]:
+        return {
+            "filename": str(getattr(media, "filename", Path(media.path).name)),
+            "relative_path": getattr(media, "relative_path", ""),
+            "size_bytes": size,
+            "limit_bytes": PART2_IMAGE_MAX_BYTES,
+            "reason": "exceeds_part2_image_limit",
+        }
 
     async def _upload_images(
         self,
         job: Job,
         images: list[Any],
     ) -> None:
-        """Upload detected images to ImgBB."""
+        """Upload eligible images (<= 2 MiB) to ImgBB and Telegraph.
+
+        Images over the limit are skipped (recorded in
+        ``metadata["part2_skipped_large_images"]``) and neither provider is
+        called for them. This intentional skip is not an upload failure.
+        Each provider's result/failure is recorded independently.
+        """
+
+        # ----- classify by size before any provider is called ----------
+        eligible: list[tuple[Any, Path, str]] = []
+        skipped: list[dict[str, Any]] = []
 
         for media in images:
-            if job.cancel_requested:
-                raise asyncio.CancelledError()
-
-            image_path = Path(
-                media.path,
-            )
-
-            filename = getattr(
-                media,
-                "filename",
-                image_path.name,
-            )
-
-            # ----------------------------------------------------------
-            # ImgBB
-            # ----------------------------------------------------------
+            image_path = Path(media.path)
+            filename = str(getattr(media, "filename", image_path.name))
 
             try:
+                size = image_path.stat().st_size
+            except OSError as exc:
+                self._record_failure_both(job, media, filename, f"Could not stat image: {exc}")
+                continue
+
+            if size > PART2_IMAGE_MAX_BYTES:
+                skipped.append(self._skipped_entry(media, size))
                 logger.info(
-                    "Job %s: uploading image to ImgBB: %s",
+                    "Job %s: skipping %s (%s bytes > Part 2 limit)",
                     job.job_id,
                     filename,
+                    size,
                 )
+                continue
 
-                response = await self.imgbb_uploader.upload(
-                    image_path,
-                )
+            eligible.append((media, image_path, filename))
 
-                result = UploadResult(
-                    provider="imgbb",
-                    media_type="image",
-                    filename=str(filename),
-                    url=str(
-                        response.get("url", "")
-                    ),
-                    display_url=response.get(
-                        "display_url"
-                    ),
-                    provider_id=response.get(
-                        "id"
-                    ),
-                    size_bytes=response.get(
-                        "size"
-                    ),
-                    width=response.get(
-                        "width"
-                    ),
-                    height=response.get(
-                        "height"
-                    ),
-                    extra={
-                        "path": str(image_path),
-                        "relative_path": getattr(
-                            media,
-                            "relative_path",
-                            "",
-                        ),
-                    },
-                )
+        self.job_manager.set_metadata(
+            job.job_id,
+            "part2_skipped_large_images",
+            skipped,
+        )
 
-                self.job_manager.add_upload_result(
-                    job.job_id,
-                    result,
-                )
+        if not eligible:
+            return
 
-            except ImgBBUploadError as exc:
-                logger.warning(
-                    "Job %s: ImgBB upload failed for %s: %s",
-                    job.job_id,
-                    filename,
-                    exc,
-                )
+        self._checkpoint(job)  # before image uploads
 
-                self.job_manager.add_upload_failure(
-                    job.job_id,
-                    UploadFailure(
-                        provider="imgbb",
-                        media_type="image",
-                        filename=str(filename),
-                        error=str(exc),
-                        extra={
-                            "path": str(image_path),
-                        },
-                    ),
-                )
+        self.job_manager.set_status(job.job_id, JobStatus.UPLOADING)
+        await self._notify(job)
 
-            except Exception as exc:
-                logger.exception(
-                    "Job %s: unexpected ImgBB error for %s",
-                    job.job_id,
-                    filename,
-                )
+        for media, image_path, filename in eligible:
+            self._checkpoint(job)
 
-                self.job_manager.add_upload_failure(
-                    job.job_id,
-                    UploadFailure(
-                        provider="imgbb",
-                        media_type="image",
-                        filename=str(filename),
-                        error=(
-                            f"{type(exc).__name__}: {exc}"
-                        ),
-                        extra={
-                            "path": str(image_path),
-                        },
-                    ),
-                )
+            await self._upload_one(job, media, image_path, filename, "imgbb", self.imgbb_uploader)
+
+            self._checkpoint(job)  # between provider uploads
+
+            await self._upload_one(job, media, image_path, filename, "telegraph", self.telegraph_uploader)
 
             await self._notify(job)
+
+    def _record_failure_both(
+        self,
+        job: Job,
+        media: Any,
+        filename: str,
+        error: str,
+    ) -> None:
+        for provider in ("imgbb", "telegraph"):
+            self.job_manager.add_upload_failure(
+                job.job_id,
+                UploadFailure(
+                    provider=provider,
+                    media_type="image",
+                    filename=filename,
+                    error=error,
+                    extra={"path": str(media.path)},
+                ),
+            )
+
+    async def _upload_one(
+        self,
+        job: Job,
+        media: Any,
+        image_path: Path,
+        filename: str,
+        provider: str,
+        uploader: Any,
+    ) -> None:
+        """Upload one image to one provider and record the outcome."""
+
+        extra = {
+            "path": str(image_path),
+            "relative_path": getattr(media, "relative_path", ""),
+        }
+
+        try:
+            logger.info(
+                "Job %s: uploading image to %s: %s",
+                job.job_id,
+                provider,
+                filename,
+            )
+
+            response = await uploader.upload(image_path)
+
+            self.job_manager.add_upload_result(
+                job.job_id,
+                UploadResult(
+                    media_type="image",
+                    filename=filename,
+                    provider=provider,
+                    url=str(response.get("url", "")),
+                    display_url=response.get("display_url"),
+                    provider_id=response.get("id"),
+                    size_bytes=response.get("size"),
+                    width=response.get("width"),
+                    height=response.get("height"),
+                    extra=extra,
+                ),
+            )
+
+        except UploadError as exc:
+            logger.warning(
+                "Job %s: %s upload failed for %s: %s",
+                job.job_id,
+                provider,
+                filename,
+                exc,
+            )
+            self.job_manager.add_upload_failure(
+                job.job_id,
+                UploadFailure(
+                    provider=provider,
+                    media_type="image",
+                    filename=filename,
+                    error=str(exc),
+                    extra=extra,
+                ),
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Job %s: unexpected %s error for %s",
+                job.job_id,
+                provider,
+                filename,
+            )
+            self.job_manager.add_upload_failure(
+                job.job_id,
+                UploadFailure(
+                    provider=provider,
+                    media_type="image",
+                    filename=filename,
+                    error=f"{type(exc).__name__}: {exc}",
+                    extra=extra,
+                ),
+            )
 
     # ------------------------------------------------------------------
     # PROGRESS
