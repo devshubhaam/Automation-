@@ -311,21 +311,30 @@ class PipelineWorker:
                 )
 
         finally:
-    try:
-        self.job_manager.remove_from_queue(job_id)
-    except Exception:
-        logger.exception(
-            "Job %s: failed to remove from queue",
-            job_id,
-        )
+            # Remove ONLY this completed/failed/cancelled job
+            # from JobManager's bookkeeping queue.
+            #
+            # Do not use dequeue() here because dequeue() could
+            # accidentally remove another job waiting in the queue.
+            try:
+                self.job_manager.remove_from_queue(job_id)
 
-    try:
-        self.job_manager.cleanup_job_files(job_id)
-    except Exception:
-        logger.exception(
-            "Job %s: cleanup failed",
-            job_id,
-        )
+            except Exception:
+                logger.exception(
+                    "Job %s: failed to remove from queue",
+                    job_id,
+                )
+
+            # Cleanup downloaded/extracted job files.
+            try:
+                self.job_manager.cleanup_job_files(job_id)
+
+            except Exception:
+                logger.exception(
+                    "Job %s: cleanup failed",
+                    job_id,
+                )
+
     async def _download(self, job):
         """Download the Telegram document for the job."""
         message = getattr(
@@ -566,6 +575,7 @@ def main() -> None:
             "Application terminated unexpectedly"
         )
         raise
+
 
 if __name__ == "__main__":
     main()
