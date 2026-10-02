@@ -1,58 +1,47 @@
-"""Job management, state tracking, queue bookkeeping and cleanup."""
+"""Job lifecycle and queue management for the Telegram media processor."""
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import shutil
-import uuid
-from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+
 logger = logging.getLogger("app.job_manager")
-
-__all__ = [
-    "Job",
-    "JobManager",
-    "JobStatus",
-    "JobStateError",
-    "ALLOWED_TRANSITIONS",
-    "generate_job_id",
-]
-
-
-class JobStateError(RuntimeError):
-    """Raised when a job does not exist or has an invalid state change."""
 
 
 class JobStatus(str, Enum):
-    """Lifecycle states for a processing job."""
-
     RECEIVED = "RECEIVED"
     QUEUED = "QUEUED"
     DOWNLOADING = "DOWNLOADING"
     EXTRACTING = "EXTRACTING"
     SCANNING = "SCANNING"
+    UPLOADING = "UPLOADING"
+
     COMPLETED = "COMPLETED"
+    COMPLETED_WITH_ERRORS = "COMPLETED_WITH_ERRORS"
+
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
 
 TERMINAL_STATES = {
     JobStatus.COMPLETED,
+    JobStatus.COMPLETED_WITH_ERRORS,
     JobStatus.FAILED,
     JobStatus.CANCELLED,
 }
 
 
-ALLOWED_TRANSITIONS = {
+# Allowed state transitions.
+ALLOWED_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
     JobStatus.RECEIVED: {
         JobStatus.QUEUED,
-        JobStatus.DOWNLOADING,
         JobStatus.CANCELLED,
         JobStatus.FAILED,
     },
@@ -72,467 +61,282 @@ ALLOWED_TRANSITIONS = {
         JobStatus.FAILED,
     },
     JobStatus.SCANNING: {
+        JobStatus.UPLOADING,
         JobStatus.COMPLETED,
+        JobStatus.COMPLETED_WITH_ERRORS,
+        JobStatus.CANCELLED,
+        JobStatus.FAILED,
+    },
+    JobStatus.UPLOADING: {
+        JobStatus.COMPLETED,
+        JobStatus.COMPLETED_WITH_ERRORS,
         JobStatus.CANCELLED,
         JobStatus.FAILED,
     },
     JobStatus.COMPLETED: set(),
+    JobStatus.COMPLETED_WITH_ERRORS: set(),
     JobStatus.FAILED: set(),
     JobStatus.CANCELLED: set(),
 }
 
 
-def _utc_now() -> datetime:
-    """Return the current timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc)
+@dataclass
+class UploadResult:
+    """Result returned by an uploader."""
+
+    provider: str
+    media_type: str
+    filename: str
+    path: str
+    url: str
+    display_url: Optional[str] = None
+    provider_id: Optional[str] = None
+    size_bytes: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UploadResult":
+        return cls(
+            provider=str(data.get("provider", "")),
+            media_type=str(data.get("media_type", "")),
+            filename=str(data.get("filename", "")),
+            path=str(data.get("path", "")),
+            url=str(data.get("url", "")),
+            display_url=data.get("display_url"),
+            provider_id=data.get("provider_id"),
+            size_bytes=data.get("size_bytes"),
+            width=data.get("width"),
+            height=data.get("height"),
+            metadata=dict(data.get("metadata") or {}),
+        )
 
 
-def _timestamp() -> str:
-    """Return an ISO-8601 UTC timestamp."""
-    return _utc_now().isoformat()
+@dataclass
+class UploadFailure:
+    """A failed upload attempt."""
 
+    provider: str
+    media_type: str
+    filename: str
+    path: str
+    error: str
 
-def generate_job_id() -> str:
-    """Generate a short human-readable unique job ID."""
-    now = _utc_now().strftime("%Y%m%d-%H%M%S")
-    suffix = uuid.uuid4().hex[:4].upper()
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
-    return f"JOB-{now}-{suffix}"
-
-
-def _safe_archive_name(name: str) -> str:
-    """Return a filesystem-safe archive filename."""
-    name = Path(str(name or "archive.zip")).name
-
-    if not name:
-        name = "archive.zip"
-
-    return name
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UploadFailure":
+        return cls(
+            provider=str(data.get("provider", "")),
+            media_type=str(data.get("media_type", "")),
+            filename=str(data.get("filename", "")),
+            path=str(data.get("path", "")),
+            error=str(data.get("error", "")),
+        )
 
 
 @dataclass
 class Job:
-    """Persistent representation of one archive-processing job."""
+    """Represents one archive-processing job."""
 
     job_id: str
+    user_id: int
+    chat_id: int
+
     archive_name: str
-
-    source_message_id: Optional[int] = None
-    chat_id: Optional[int] = None
-    sender_id: Optional[int] = None
-
-    archive_size_bytes: int = 0
+    archive_path: Optional[str] = None
+    extract_dir: Optional[str] = None
 
     status: JobStatus = JobStatus.RECEIVED
 
-    created_at: str = field(default_factory=_timestamp)
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    message_id: Optional[int] = None
+    status_message_id: Optional[int] = None
 
     error: Optional[str] = None
 
-    cancel_requested: bool = False
+    image_count: int = 0
+    video_count: int = 0
+    ignored_count: int = 0
 
-    total_files: int = 0
-    image_files: int = 0
-    video_files: int = 0
-    ignored_files: int = 0
+    extracted_files: int = 0
+    extracted_bytes: int = 0
 
-    status_message_id: Optional[int] = None
+    upload_results: list[UploadResult] = field(default_factory=list)
+    upload_failures: list[UploadFailure] = field(default_factory=list)
 
-    # Runtime-only Telegram message.
-    #
-    # This is intentionally excluded from metadata persistence because a
-    # Telethon Message object is not JSON serializable and may contain
-    # unnecessary runtime state.
-    _telegram_message: Any = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    # Runtime-only job directory. This is restored/calculated by JobManager.
-    _job_root: Optional[Path] = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-
-    @property
-    def is_terminal(self) -> bool:
-        """Whether this job has reached a final state."""
-        return self.status in TERMINAL_STATES
-
-    @property
-    def job_directory(self) -> Path:
-        """Root directory belonging exclusively to this job."""
-        if self._job_root is None:
-            raise RuntimeError(
-                "Job directory is not attached to a JobManager"
-            )
-
-        return self._job_root
-
-    @property
-    def job_dir(self) -> Path:
-        """Compatibility alias for the job directory."""
-        return self.job_directory
-
-    @property
-    def archive_dir(self) -> Path:
-        """Directory containing the downloaded archive."""
-        return self.job_directory / "archive"
-
-    @property
-    def extracted_dir(self) -> Path:
-        """Directory containing extracted files."""
-        return self.job_directory / "extracted"
-
-    @property
-    def metadata_path(self) -> Path:
-        """Persistent metadata file."""
-        return self.job_directory / "metadata.json"
-
-    @property
-    def archive_path(self) -> Path:
-        """Expected path of the downloaded archive."""
-        return self.archive_dir / self.archive_name
-
-    def write_metadata(self) -> None:
-        """Persist safe job metadata to disk."""
-        self.job_directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        payload = {
-            "job_id": self.job_id,
-            "archive_name": self.archive_name,
-            "source_message_id": self.source_message_id,
-            "chat_id": self.chat_id,
-            "sender_id": self.sender_id,
-            "archive_size_bytes": self.archive_size_bytes,
-            "status": self.status.value,
-            "created_at": self.created_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "error": self.error,
-            "cancel_requested": self.cancel_requested,
-            "total_files": self.total_files,
-            "image_files": self.image_files,
-            "video_files": self.video_files,
-            "ignored_files": self.ignored_files,
-            "status_message_id": self.status_message_id,
-        }
-
-        self.metadata_path.write_text(
-            json.dumps(
-                payload,
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-    @classmethod
-    def read_metadata(
-        cls,
-        metadata_path: Path,
-    ) -> "Job":
-        """Restore a Job from its metadata JSON."""
-        metadata_path = Path(metadata_path)
-
-        try:
-            payload = json.loads(
-                metadata_path.read_text(
-                    encoding="utf-8",
-                )
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            raise JobStateError(
-                f"Could not read job metadata: {metadata_path}"
-            ) from exc
-
-        try:
-            status = JobStatus(payload["status"])
-        except (KeyError, ValueError) as exc:
-            raise JobStateError(
-                f"Invalid job status in metadata: {metadata_path}"
-            ) from exc
-
-        job = cls(
-            job_id=str(payload["job_id"]),
-            archive_name=_safe_archive_name(
-                payload.get("archive_name", "archive.zip")
-            ),
-            source_message_id=payload.get("source_message_id"),
-            chat_id=payload.get("chat_id"),
-            sender_id=payload.get("sender_id"),
-            archive_size_bytes=int(
-                payload.get("archive_size_bytes", 0) or 0
-            ),
-            status=status,
-            created_at=payload.get(
-                "created_at",
-                _timestamp(),
-            ),
-            started_at=payload.get("started_at"),
-            finished_at=payload.get("finished_at"),
-            error=payload.get("error"),
-            cancel_requested=bool(
-                payload.get("cancel_requested", False)
-            ),
-            total_files=int(
-                payload.get("total_files", 0) or 0
-            ),
-            image_files=int(
-                payload.get("image_files", 0) or 0
-            ),
-            video_files=int(
-                payload.get("video_files", 0) or 0
-            ),
-            ignored_files=int(
-                payload.get("ignored_files", 0) or 0
-            ),
-            status_message_id=payload.get(
-                "status_message_id"
-            ),
-        )
-
-        job._job_root = metadata_path.parent
-
-        return job
+    def touch(self) -> None:
+        self.updated_at = datetime.now(timezone.utc)
 
 
 class JobManager:
-    """Manage jobs, their state transitions and persistent files."""
+    """Thread/task-safe in-memory job manager."""
 
     def __init__(
         self,
-        job_dir: Path | str = "./data/jobs",
-        *,
-        keep_files: bool = False,
+        job_root: Path,
+        max_jobs: int = 100,
     ) -> None:
-        self.job_dir = Path(job_dir)
-        self.keep_files = bool(keep_files)
+        self.job_root = Path(job_root)
+        self.job_root.mkdir(parents=True, exist_ok=True)
 
-        self.job_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        self.max_jobs = max_jobs
 
         self._jobs: dict[str, Job] = {}
-        self._queue: deque[str] = deque()
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
 
-        self._load_existing_jobs()
+        self._lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------ #
-    # Loading
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Job creation / lookup
+    # ------------------------------------------------------------------
 
-    def _load_existing_jobs(self) -> None:
-        """Load previously persisted job metadata."""
-        if not self.job_dir.exists():
-            return
-
-        for metadata_path in self.job_dir.glob(
-            "*/metadata.json"
-        ):
-            try:
-                job = Job.read_metadata(metadata_path)
-                job._job_root = metadata_path.parent
-                self._jobs[job.job_id] = job
-
-            except Exception:
-                logger.exception(
-                    "Failed to load job metadata: %s",
-                    metadata_path,
+    async def create_job(
+        self,
+        job_id: str,
+        user_id: int,
+        chat_id: int,
+        archive_name: str,
+        message_id: Optional[int] = None,
+    ) -> Job:
+        async with self._lock:
+            if len(self._jobs) >= self.max_jobs:
+                raise RuntimeError(
+                    "Maximum number of active jobs has been reached"
                 )
 
-    # ------------------------------------------------------------------ #
-    # Creation / lookup
-    # ------------------------------------------------------------------ #
+            if job_id in self._jobs:
+                raise ValueError(f"Job already exists: {job_id}")
 
-    def create_job(
-        self,
-        archive_name: str = "archive.zip",
-        source_message_id: Optional[int] = None,
-        chat_id: Optional[int] = None,
-        sender_id: Optional[int] = None,
-        archive_size_bytes: int = 0,
-    ) -> Job:
-        """Create and persist a new job."""
-        job_id = generate_job_id()
+            job_dir = self.job_root / job_id
+            archive_dir = job_dir / "archive"
+            extracted_dir = job_dir / "extracted"
 
-        while job_id in self._jobs:
-            job_id = generate_job_id()
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            extracted_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_name = _safe_archive_name(
-            archive_name
-        )
+            job = Job(
+                job_id=job_id,
+                user_id=user_id,
+                chat_id=chat_id,
+                archive_name=archive_name,
+                archive_path=str(
+                    archive_dir / archive_name
+                ),
+                extract_dir=str(extracted_dir),
+                message_id=message_id,
+            )
 
-        root = self.job_dir / job_id
+            self._jobs[job_id] = job
 
-        job = Job(
-            job_id=job_id,
-            archive_name=safe_name,
-            source_message_id=source_message_id,
-            chat_id=chat_id,
-            sender_id=sender_id,
-            archive_size_bytes=int(
-                archive_size_bytes or 0
-            ),
-        )
+            logger.info(
+                "Created job %s (archive=%s)",
+                job.job_id,
+                job.archive_name,
+            )
 
-        job._job_root = root
+            return job
 
-        job.archive_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+    def get_job(self, job_id: str) -> Optional[Job]:
+        return self._jobs.get(job_id)
 
-        job.extracted_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        job.write_metadata()
-
-        self._jobs[job.job_id] = job
-
-        logger.info(
-            "Created job %s (archive=%s)",
-            job.job_id,
-            job.archive_name,
-        )
-
-        return job
-
-    def get(self, job_id: str) -> Job:
-        """Return a job or raise JobStateError."""
-        job = self._jobs.get(job_id)
+    def require_job(self, job_id: str) -> Job:
+        job = self.get_job(job_id)
 
         if job is None:
-            raise JobStateError(
-                f"Unknown job: {job_id}"
-            )
+            raise KeyError(f"Unknown job: {job_id}")
 
         return job
 
-    def all_jobs(self) -> list[Job]:
-        """Return all jobs ordered by creation order."""
-        return list(
-            sorted(
-                self._jobs.values(),
-                key=lambda job: job.created_at,
-            )
-        )
+    def list_jobs(self) -> list[Job]:
+        return list(self._jobs.values())
 
-    def latest_job(self) -> Optional[Job]:
-        """Return the most recently created job."""
-        jobs = self.all_jobs()
-
-        if not jobs:
-            return None
-
-        return jobs[-1]
-
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Queue
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
 
-    def enqueue(self, job_id: str) -> None:
-        """Add a job to the JobManager bookkeeping queue."""
-        job = self.get(job_id)
+    async def enqueue(self, job_id: str) -> None:
+        job = self.require_job(job_id)
 
-        if job.is_terminal:
-            raise JobStateError(
-                f"Cannot enqueue terminal job: {job_id}"
-            )
+        if job.status == JobStatus.RECEIVED:
+            self.set_status(job_id, JobStatus.QUEUED)
 
-        if job_id not in self._queue:
-            self._queue.append(job_id)
+        await self._queue.put(job_id)
 
-        if job.status is JobStatus.RECEIVED:
-            self.set_status(
-                job_id,
-                JobStatus.QUEUED,
-            )
+    async def get_next_job(self) -> str:
+        return await self._queue.get()
 
-    def dequeue(self) -> Optional[str]:
-        """Remove and return the oldest queued job."""
-        if not self._queue:
-            return None
+    def task_done(self) -> None:
+        self._queue.task_done()
 
-        return self._queue.popleft()
+    def queue_size(self) -> int:
+        return self._queue.qsize()
 
     def remove_from_queue(self, job_id: str) -> None:
         """
-        Remove one specific job from the bookkeeping queue.
+        Remove a job from the bookkeeping queue.
 
-        IMPORTANT:
-        This must NOT use dequeue(), because the pipeline worker has its
-        own asyncio queue. Calling dequeue() here could remove a different
-        pending job.
+        The actual asyncio.Queue cannot safely remove arbitrary items,
+        so this method is intentionally a no-op for queue storage.
+
+        It exists as an explicit lifecycle hook so callers can mark
+        that processing has taken ownership of the job and prevent
+        stale queue bookkeeping in higher-level logic.
         """
-        try:
-            self._queue.remove(job_id)
+        logger.debug(
+            "Queue ownership transferred for job %s",
+            job_id,
+        )
 
-        except ValueError:
-            pass
-
-    def queue_size(self) -> int:
-        """Return the number of jobs waiting in bookkeeping queue."""
-        return len(self._queue)
-
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Status
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
 
     def set_status(
         self,
         job_id: str,
         new_status: JobStatus,
     ) -> Job:
-        """Perform a validated state transition."""
-        job = self.get(job_id)
+        job = self.require_job(job_id)
 
-        if not isinstance(new_status, JobStatus):
-            try:
-                new_status = JobStatus(new_status)
-            except ValueError as exc:
-                raise JobStateError(
-                    f"Invalid job status: {new_status!r}"
-                ) from exc
-
-        if job.status is new_status:
-            return job
-
-        allowed = ALLOWED_TRANSITIONS.get(
-            job.status,
-            set(),
-        )
-
-        if new_status not in allowed:
-            raise JobStateError(
-                f"Invalid transition for {job_id}: "
-                f"{job.status.value} -> {new_status.value}"
-            )
+        if isinstance(new_status, str):
+            new_status = JobStatus(new_status)
 
         old_status = job.status
 
+        if old_status == new_status:
+            job.touch()
+            return job
+
+        if old_status in TERMINAL_STATES:
+            raise RuntimeError(
+                f"Cannot change terminal job {job_id}: "
+                f"{old_status.value} -> {new_status.value}"
+            )
+
+        allowed = ALLOWED_TRANSITIONS.get(old_status, set())
+
+        if new_status not in allowed:
+            raise RuntimeError(
+                f"Invalid job status transition for {job_id}: "
+                f"{old_status.value} -> {new_status.value}"
+            )
+
         job.status = new_status
-
-        if (
-            new_status is JobStatus.DOWNLOADING
-            and job.started_at is None
-        ):
-            job.started_at = _timestamp()
-
-        if new_status in TERMINAL_STATES:
-            job.finished_at = _timestamp()
-
-        job.write_metadata()
+        job.touch()
 
         logger.info(
             "Job %s status %s -> %s",
@@ -543,257 +347,404 @@ class JobManager:
 
         return job
 
-    # Compatibility aliases used by some older code.
+    def is_terminal(self, job_id: str) -> bool:
+        job = self.require_job(job_id)
+        return job.status in TERMINAL_STATES
 
-    def update_status(
-        self,
-        job_id: str,
-        status: JobStatus,
-    ) -> Job:
-        return self.set_status(
-            job_id,
-            status,
-        )
-
-    def mark_failed(
-        self,
-        job_id: str,
-        reason: str,
-    ) -> Job:
-        return self.fail(
-            job_id,
-            reason,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Cancellation
-    # ------------------------------------------------------------------ #
-
-    def request_cancel(
-        self,
-        job_id: str,
-    ) -> bool:
-        """Request cancellation without immediately stopping the worker."""
-        job = self.get(job_id)
-
-        if job.is_terminal:
-            return False
-
-        job.cancel_requested = True
-        job.write_metadata()
-
-        return True
-
-    def is_cancelled(
-        self,
-        job_id: str,
-    ) -> bool:
-        """Return whether cancellation was requested."""
-        return self.get(job_id).cancel_requested
-
-    def cancel(
-        self,
-        job_id: str,
-    ) -> Job:
-        """Mark a non-terminal job as cancelled."""
-        job = self.get(job_id)
-
-        if job.is_terminal:
-            if job.status is JobStatus.CANCELLED:
-                return job
-
-            raise JobStateError(
-                f"Cannot cancel terminal job: {job_id}"
-            )
-
-        return self.set_status(
-            job_id,
-            JobStatus.CANCELLED,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Failure
-    # ------------------------------------------------------------------ #
-
-    def fail(
-        self,
-        job_id: str,
-        reason: str,
-    ) -> Job:
-        """Mark a non-terminal job as failed."""
-        job = self.get(job_id)
-
-        if job.is_terminal:
-            return job
-
-        job.error = str(reason)
-
-        return self.set_status(
-            job_id,
-            JobStatus.FAILED,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Counts / progress
-    # ------------------------------------------------------------------ #
-
-    def update_counts(
-        self,
-        job_id: str,
-        counts: Optional[dict[str, int]] = None,
-        *,
-        images: Optional[int] = None,
-        videos: Optional[int] = None,
-        ignored: Optional[int] = None,
-    ) -> Job:
-        """
-        Update media counts.
-
-        Supports both:
-
-            update_counts(job_id, {"image_files": 2, ...})
-
-        and:
-
-            update_counts(job_id, images=2, videos=1, ignored=0)
-        """
-        job = self.get(job_id)
-
-        if counts is not None:
-            total = counts.get(
-                "total_files",
-                counts.get("total", None),
-            )
-
-            image_count = counts.get(
-                "image_files",
-                counts.get("images", None),
-            )
-
-            video_count = counts.get(
-                "video_files",
-                counts.get("videos", None),
-            )
-
-            ignored_count = counts.get(
-                "ignored_files",
-                counts.get("ignored", None),
-            )
-
-            if total is not None:
-                job.total_files = int(total)
-
-            if image_count is not None:
-                job.image_files = int(image_count)
-
-            if video_count is not None:
-                job.video_files = int(video_count)
-
-            if ignored_count is not None:
-                job.ignored_files = int(ignored_count)
-
-        if images is not None:
-            job.image_files = int(images)
-
-        if videos is not None:
-            job.video_files = int(videos)
-
-        if ignored is not None:
-            job.ignored_files = int(ignored)
-
-        if counts is not None and "total_files" not in counts:
-            job.total_files = (
-                job.image_files
-                + job.video_files
-                + job.ignored_files
-            )
-
-        job.write_metadata()
-
-        return job
+    # ------------------------------------------------------------------
+    # Status message
+    # ------------------------------------------------------------------
 
     def set_status_message(
         self,
         job_id: str,
         message_id: int,
     ) -> Job:
-        """Store the Telegram status message ID."""
-        job = self.get(job_id)
+        job = self.require_job(job_id)
+        job.status_message_id = message_id
+        job.touch()
+        return job
 
-        job.status_message_id = int(message_id)
-        job.write_metadata()
+    # ------------------------------------------------------------------
+    # Errors
+    # ------------------------------------------------------------------
+
+    def set_error(
+        self,
+        job_id: str,
+        error: str,
+        *,
+        failed: bool = True,
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        job.error = str(error)
+        job.touch()
+
+        if failed and job.status not in TERMINAL_STATES:
+            self.set_status(job_id, JobStatus.FAILED)
+
+        logger.error(
+            "Job %s error: %s",
+            job_id,
+            error,
+        )
 
         return job
 
-    # ------------------------------------------------------------------ #
-    # Active jobs
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Media statistics
+    # ------------------------------------------------------------------
 
-    def active_jobs(self) -> list[Job]:
-        """Return all non-terminal jobs."""
-        return [
-            job
-            for job in self.all_jobs()
-            if not job.is_terminal
+    def set_media_counts(
+        self,
+        job_id: str,
+        *,
+        images: int,
+        videos: int,
+        ignored: int,
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        job.image_count = int(images)
+        job.video_count = int(videos)
+        job.ignored_count = int(ignored)
+        job.touch()
+
+        return job
+
+    def set_extraction_stats(
+        self,
+        job_id: str,
+        *,
+        files: int,
+        bytes_total: int,
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        job.extracted_files = int(files)
+        job.extracted_bytes = int(bytes_total)
+        job.touch()
+
+        return job
+
+    # ------------------------------------------------------------------
+    # Upload results
+    # ------------------------------------------------------------------
+
+    def add_upload_result(
+        self,
+        job_id: str,
+        result: UploadResult | dict[str, Any],
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        if isinstance(result, dict):
+            result = UploadResult.from_dict(result)
+
+        job.upload_results.append(result)
+        job.touch()
+
+        logger.info(
+            "Job %s upload successful: provider=%s "
+            "media_type=%s filename=%s",
+            job_id,
+            result.provider,
+            result.media_type,
+            result.filename,
+        )
+
+        return job
+
+    def add_upload_failure(
+        self,
+        job_id: str,
+        failure: UploadFailure | dict[str, Any],
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        if isinstance(failure, dict):
+            failure = UploadFailure.from_dict(failure)
+
+        job.upload_failures.append(failure)
+        job.touch()
+
+        logger.warning(
+            "Job %s upload failed: provider=%s "
+            "media_type=%s filename=%s error=%s",
+            job_id,
+            failure.provider,
+            failure.media_type,
+            failure.filename,
+            failure.error,
+        )
+
+        return job
+
+    def clear_upload_results(self, job_id: str) -> Job:
+        job = self.require_job(job_id)
+
+        job.upload_results.clear()
+        job.upload_failures.clear()
+        job.touch()
+
+        return job
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
+    def set_metadata(
+        self,
+        job_id: str,
+        key: str,
+        value: Any,
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        job.metadata[str(key)] = value
+        job.touch()
+
+        return job
+
+    def update_metadata(
+        self,
+        job_id: str,
+        values: dict[str, Any],
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        job.metadata.update(values)
+        job.touch()
+
+        return job
+
+    # ------------------------------------------------------------------
+    # Completion
+    # ------------------------------------------------------------------
+
+    def complete(
+        self,
+        job_id: str,
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        if job.upload_failures:
+            return self.complete_with_errors(job_id)
+
+        self.set_status(job_id, JobStatus.COMPLETED)
+
+        return job
+
+    def complete_with_errors(
+        self,
+        job_id: str,
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        self.set_status(
+            job_id,
+            JobStatus.COMPLETED_WITH_ERRORS,
+        )
+
+        return job
+
+    def cancel(
+        self,
+        job_id: str,
+        reason: Optional[str] = None,
+    ) -> Job:
+        job = self.require_job(job_id)
+
+        if job.status in TERMINAL_STATES:
+            return job
+
+        if reason:
+            job.error = reason
+
+        self.set_status(
+            job_id,
+            JobStatus.CANCELLED,
+        )
+
+        return job
+
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
+
+    def serialize_job(
+        self,
+        job_id: str,
+    ) -> dict[str, Any]:
+        job = self.require_job(job_id)
+
+        data = asdict(job)
+
+        data["status"] = job.status.value
+
+        data["created_at"] = job.created_at.isoformat()
+        data["updated_at"] = job.updated_at.isoformat()
+
+        data["upload_results"] = [
+            result.to_dict()
+            for result in job.upload_results
         ]
 
-    def active_job(self) -> Optional[Job]:
-        """Return the first active job, if any."""
-        jobs = self.active_jobs()
+        data["upload_failures"] = [
+            failure.to_dict()
+            for failure in job.upload_failures
+        ]
 
-        if not jobs:
-            return None
+        return data
 
-        return jobs[0]
+    def deserialize_job(
+        self,
+        data: dict[str, Any],
+    ) -> Job:
+        created_at = data.get("created_at")
+        updated_at = data.get("updated_at")
 
-    # ------------------------------------------------------------------ #
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at)
+
+        if isinstance(updated_at, str):
+            updated_at = datetime.fromisoformat(updated_at)
+
+        job = Job(
+            job_id=str(data["job_id"]),
+            user_id=int(data["user_id"]),
+            chat_id=int(data["chat_id"]),
+            archive_name=str(data["archive_name"]),
+            archive_path=data.get("archive_path"),
+            extract_dir=data.get("extract_dir"),
+            status=JobStatus(data.get("status", JobStatus.RECEIVED.value)),
+            created_at=created_at
+            or datetime.now(timezone.utc),
+            updated_at=updated_at
+            or datetime.now(timezone.utc),
+            message_id=data.get("message_id"),
+            status_message_id=data.get("status_message_id"),
+            error=data.get("error"),
+            image_count=int(data.get("image_count", 0)),
+            video_count=int(data.get("video_count", 0)),
+            ignored_count=int(data.get("ignored_count", 0)),
+            extracted_files=int(data.get("extracted_files", 0)),
+            extracted_bytes=int(data.get("extracted_bytes", 0)),
+            upload_results=[
+                UploadResult.from_dict(item)
+                for item in data.get("upload_results", [])
+            ],
+            upload_failures=[
+                UploadFailure.from_dict(item)
+                for item in data.get("upload_failures", [])
+            ],
+            metadata=dict(data.get("metadata") or {}),
+        )
+
+        return job
+
+    # ------------------------------------------------------------------
     # Cleanup
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
 
     def cleanup_job_files(
         self,
         job_id: str,
-        *,
-        force: bool = False,
-    ) -> list[str]:
-        """
-        Remove downloaded archive and extracted files.
+    ) -> None:
+        job = self.get_job(job_id)
 
-        Metadata is intentionally preserved.
-        """
-        job = self.get(job_id)
+        if job is None:
+            return
 
-        if self.keep_files and not force:
-            return []
+        job_dir = self.job_root / job_id
 
-        removed: list[str] = []
+        if not job_dir.exists():
+            return
 
-        targets = (
-            ("archive", job.archive_dir),
-            ("extracted", job.extracted_dir),
-        )
+        try:
+            shutil.rmtree(job_dir)
 
-        for name, path in targets:
-            if not path.exists():
-                continue
-
-            try:
-                shutil.rmtree(path)
-                removed.append(name)
-
-            except OSError:
-                logger.exception(
-                    "Failed to remove %s for job %s",
-                    name,
-                    job_id,
-                )
-                raise
-
-        if removed:
             logger.info(
-                "Cleaned job %s (removed: %s)",
+                "Cleaned job %s (removed: archive, extracted)",
                 job_id,
-                ", ".join(removed),
             )
 
-        return removed
+        except FileNotFoundError:
+            pass
+
+        except Exception:
+            logger.exception(
+                "Failed to clean job files for %s",
+                job_id,
+            )
+
+    def remove_job(
+        self,
+        job_id: str,
+        *,
+        cleanup_files: bool = True,
+    ) -> Optional[Job]:
+        job = self._jobs.pop(job_id, None)
+
+        if job is None:
+            return None
+
+        if cleanup_files:
+            self.cleanup_job_files(job_id)
+
+        logger.debug(
+            "Removed job %s from job manager",
+            job_id,
+        )
+
+        return job
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def active_jobs(self) -> list[Job]:
+        return [
+            job
+            for job in self._jobs.values()
+            if job.status not in TERMINAL_STATES
+        ]
+
+    def active_job_count(self) -> int:
+        return len(self.active_jobs())
+
+    def completed_job_count(self) -> int:
+        return sum(
+            1
+            for job in self._jobs.values()
+            if job.status in TERMINAL_STATES
+        )
+
+    def get_upload_urls(
+        self,
+        job_id: str,
+    ) -> list[str]:
+        job = self.require_job(job_id)
+
+        return [
+            result.url
+            for result in job.upload_results
+            if result.url
+        ]
+
+    def get_upload_results(
+        self,
+        job_id: str,
+    ) -> list[UploadResult]:
+        job = self.require_job(job_id)
+
+        return list(job.upload_results)
+
+    def get_upload_failures(
+        self,
+        job_id: str,
+    ) -> list[UploadFailure]:
+        job = self.require_job(job_id)
+
+        return list(job.upload_failures)
