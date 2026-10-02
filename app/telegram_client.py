@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Optional
 
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 
 from .config import Settings
 from .job_manager import JobManager
+from .session_store import MongoSessionStore
 
 logger = logging.getLogger("app.telegram_client")
 
@@ -30,8 +33,65 @@ class TelegramUserbot:
         self.job_manager = job_manager
         self.pipeline = pipeline
 
+        # MongoDB-backed persistent session store.
+        self.session_store: Optional[MongoSessionStore] = None
+
+        # Default to the existing local Telethon session.
+        session_source = str(settings.session_path)
+
+        # If MongoDB is configured, try to restore the Telegram
+        # StringSession from MongoDB.
+        if settings.mongodb_uri:
+            logger.info(
+                "MongoDB session storage is configured"
+            )
+
+            self.session_store = MongoSessionStore(
+                settings.mongodb_uri,
+                database=settings.mongodb_database,
+                collection=settings.mongodb_collection,
+            )
+
+            try:
+                self.session_store.ping()
+
+                logger.info(
+                    "MongoDB connection successful"
+                )
+
+            except Exception:
+                logger.exception(
+                    "MongoDB connection failed"
+                )
+                raise
+
+            stored_session = self.session_store.load(
+                settings.session_name
+            )
+
+            if stored_session:
+                session_source = StringSession(
+                    stored_session
+                )
+
+                logger.info(
+                    "Loaded Telegram session from MongoDB"
+                )
+
+            else:
+                logger.info(
+                    "No Telegram session found in MongoDB; "
+                    "QR login will create the first session"
+                )
+
+        else:
+            logger.info(
+                "MONGODB_URI not configured; "
+                "using local Telegram session"
+            )
+
         self.client = TelegramClient(
-            str(settings.session_path),
+            session_source,
             settings.api_id,
             settings.api_hash,
             device_model="Media Processor",
@@ -69,7 +129,11 @@ class TelegramUserbot:
     def finish_authenticated_account(self, me) -> None:
         """Finalize the userbot after authentication."""
         self.owner_id = int(me.id)
-        self.owner_username = getattr(me, "username", None)
+        self.owner_username = getattr(
+            me,
+            "username",
+            None,
+        )
 
         logger.info(
             "Telegram authentication successful "
@@ -93,10 +157,69 @@ class TelegramUserbot:
 
         self.register_handlers()
 
+    async def persist_session(self) -> None:
+        """Persist the current authorized Telegram session to MongoDB."""
+
+        if self.session_store is None:
+            logger.debug(
+                "MongoDB session storage is disabled"
+            )
+            return
+
+        if not await self.client.is_user_authorized():
+            logger.warning(
+                "Cannot persist Telegram session: "
+                "client is not authorized"
+            )
+            return
+
+        try:
+            # Convert Telethon's current session into a StringSession.
+            session_string = StringSession.save(
+                self.client.session
+            )
+
+            await asyncio.to_thread(
+                self.session_store.save,
+                self.settings.session_name,
+                session_string,
+            )
+
+            logger.info(
+                "Telegram session persisted to MongoDB"
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to persist Telegram session to MongoDB"
+            )
+            raise
+
     async def stop(self) -> None:
-        """Disconnect Telegram."""
+        """Persist and disconnect Telegram."""
+
+        # Save the session before disconnecting.
+        if self.session_store is not None:
+            try:
+                await self.persist_session()
+
+            except Exception:
+                logger.exception(
+                    "Failed to persist Telegram session "
+                    "before shutdown"
+                )
+
         if self.client.is_connected():
             await self.client.disconnect()
+
+        if self.session_store is not None:
+            try:
+                self.session_store.close()
+
+            except Exception:
+                logger.exception(
+                    "Failed to close MongoDB session store"
+                )
 
         logger.info("Telegram client stopped")
 
@@ -120,7 +243,9 @@ class TelegramUserbot:
         async def incoming_handler(event) -> None:
             await self._handle_message(event)
 
-        logger.info("Telegram message handlers registered")
+        logger.info(
+            "Telegram message handlers registered"
+        )
 
     async def _handle_message(self, event) -> None:
         """Handle owner Telegram messages."""
@@ -132,10 +257,14 @@ class TelegramUserbot:
         if not isinstance(message, Message):
             return
 
-        text = (message.raw_text or "").strip()
+        text = (
+            message.raw_text or ""
+        ).strip()
 
         if text:
-            command = text.split(maxsplit=1)[0].lower()
+            command = (
+                text.split(maxsplit=1)[0].lower()
+            )
 
             if command == "/ping":
                 await event.reply("🏓 pong")
@@ -155,7 +284,10 @@ class TelegramUserbot:
                 return
 
             if command == "/cancel":
-                await self.handle_cancel(event, text)
+                await self.handle_cancel(
+                    event,
+                    text,
+                )
                 return
 
         if message.document:
@@ -191,8 +323,14 @@ class TelegramUserbot:
             "📊 Media Processor Status",
             "",
             f"Total jobs: {len(jobs)}",
-            f"Active jobs: {len(self.job_manager.active_jobs())}",
-            f"Queued jobs: {self.job_manager.queue_size()}",
+            (
+                "Active jobs: "
+                f"{len(self.job_manager.active_jobs())}"
+            ),
+            (
+                "Queued jobs: "
+                f"{self.job_manager.queue_size()}"
+            ),
             "",
         ]
 
@@ -201,7 +339,9 @@ class TelegramUserbot:
                 f"{job.job_id} — {job.status.value}"
             )
 
-        await event.reply("\n".join(lines))
+        await event.reply(
+            "\n".join(lines)
+        )
 
     async def handle_cancel(
         self,
@@ -209,7 +349,9 @@ class TelegramUserbot:
         text: str,
     ) -> None:
         """Request cancellation of a job."""
-        parts = text.split(maxsplit=1)
+        parts = text.split(
+            maxsplit=1
+        )
 
         if len(parts) != 2:
             await event.reply(
@@ -228,12 +370,16 @@ class TelegramUserbot:
             return
 
         try:
-            result = self.job_manager.request_cancel(job_id)
+            result = self.job_manager.request_cancel(
+                job_id
+            )
+
         except Exception:
             logger.exception(
                 "Failed to request cancellation for job %s",
                 job_id,
             )
+
             await event.reply(
                 f"❌ Could not cancel job `{job_id}`."
             )
@@ -243,18 +389,24 @@ class TelegramUserbot:
             await event.reply(
                 f"🛑 Cancellation requested for job `{job_id}`."
             )
+
         else:
             await event.reply(
                 f"❌ Job `{job_id}` was not found "
                 "or is already finished."
             )
 
-    async def handle_zip(self, message: Message) -> None:
+    async def handle_zip(
+        self,
+        message: Message,
+    ) -> None:
         """Validate and submit a ZIP document."""
         if not message.document:
             return
 
-        filename = self._document_filename(message)
+        filename = self._document_filename(
+            message
+        )
 
         mime_type = getattr(
             message.document,
@@ -265,7 +417,8 @@ class TelegramUserbot:
         is_zip = (
             filename.lower().endswith(".zip")
             or mime_type == "application/zip"
-            or mime_type == "application/x-zip-compressed"
+            or mime_type
+            == "application/x-zip-compressed"
         )
 
         if not is_zip:
@@ -275,7 +428,12 @@ class TelegramUserbot:
             return
 
         document_size = int(
-            getattr(message.document, "size", 0) or 0
+            getattr(
+                message.document,
+                "size",
+                0,
+            )
+            or 0
         )
 
         try:
@@ -287,13 +445,17 @@ class TelegramUserbot:
                 archive_size_bytes=document_size,
             )
 
-            # PipelineWorker needs the actual Telethon message
-            # to download the document later.
+            # PipelineWorker needs the actual Telethon
+            # message to download the document later.
             job._telegram_message = message
 
-            self.job_manager.enqueue(job.job_id)
+            self.job_manager.enqueue(
+                job.job_id
+            )
 
-            await self.pipeline.submit(job)
+            await self.pipeline.submit(
+                job
+            )
 
         except Exception:
             logger.exception(
@@ -308,6 +470,7 @@ class TelegramUserbot:
                         job.job_id,
                         "Failed to submit processing job",
                     )
+
             except Exception:
                 logger.exception(
                     "Failed to mark job as failed"
@@ -333,7 +496,9 @@ class TelegramUserbot:
         )
 
     @staticmethod
-    def _document_filename(message: Message) -> str:
+    def _document_filename(
+        message: Message,
+    ) -> str:
         """Get a safe filename from a Telegram document."""
         document = message.document
 
