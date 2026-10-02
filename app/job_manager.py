@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import shutil
@@ -232,19 +231,17 @@ class Job:
 
 
 class JobManager:
-    """Manage job state, persistence metadata and queue bookkeeping."""
+    """Manage job state and metadata.
+
+    This class is state/bookkeeping only. The real processing queue lives in
+    ``PipelineWorker``; JobManager deliberately has no queue of its own.
+    """
 
     def __init__(self, job_dir: str | Path) -> None:
         self.job_dir = Path(job_dir)
         self.job_dir.mkdir(parents=True, exist_ok=True)
 
         self._jobs: dict[str, Job] = {}
-
-        # This queue is bookkeeping for jobs waiting to enter the pipeline.
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
-
-        # Prevent duplicate queue entries.
-        self._queued_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Job ID
@@ -358,58 +355,18 @@ class JobManager:
         return self.list_jobs()
 
     # ------------------------------------------------------------------
-    # Queue
+    # Queueing (state only; the actual queue is PipelineWorker's)
     # ------------------------------------------------------------------
 
-    async def enqueue(self, job_id: str) -> None:
+    def mark_queued(self, job_id: str) -> Job:
+        """Move a RECEIVED job to QUEUED. Does not enqueue anything."""
+
         job = self.require_job(job_id)
-
-        if job.is_terminal():
-            return
-
-        if job_id in self._queued_ids:
-            return
-
-        self._queued_ids.add(job_id)
 
         if job.status == JobStatus.RECEIVED:
             self.set_status(job_id, JobStatus.QUEUED)
 
-        await self._queue.put(job_id)
-
-    async def get_next_job(self) -> Job:
-        job_id = await self._queue.get()
-
-        self._queued_ids.discard(job_id)
-
-        return self.require_job(job_id)
-
-    def task_done(self, job_id: Optional[str] = None) -> None:
-        """
-        Mark a queue item as processed.
-
-        job_id is accepted for compatibility, but asyncio.Queue itself
-        tracks completion independently of the ID.
-        """
-
-        self._queue.task_done()
-
-        if job_id:
-            self._queued_ids.discard(job_id)
-
-    def queue_size(self) -> int:
-        return self._queue.qsize()
-
-    def remove_from_queue(self, job_id: str) -> None:
-        """
-        Remove bookkeeping for a job.
-
-        asyncio.Queue does not safely support arbitrary removal, so the
-        actual queue item is allowed to drain while this bookkeeping
-        prevents duplicate scheduling.
-        """
-
-        self._queued_ids.discard(job_id)
+        return job
 
     # ------------------------------------------------------------------
     # Status
@@ -511,22 +468,26 @@ class JobManager:
         )
 
     def cancel(self, job_id: str) -> Job:
+        """Request cancellation of a job.
+
+        This only sets ``cancel_requested``. The worker that owns the job
+        notices the flag at its next checkpoint, stops safely and then calls
+        :meth:`mark_cancelled`. An actively processing job is therefore never
+        made terminal behind the worker's back.
+        """
+
         job = self.require_job(job_id)
+
+        if job.is_terminal():
+            return job
 
         job.cancel_requested = True
         job.touch()
 
-        if not job.is_terminal():
-            self.set_status(
-                job_id,
-                JobStatus.CANCELLED,
-            )
-
-        self.remove_from_queue(job_id)
-
         logger.info(
-            "Job %s cancelled",
+            "Job %s cancellation requested (status=%s)",
             job_id,
+            job.status,
         )
 
         return job
@@ -534,6 +495,25 @@ class JobManager:
     # Backward-compatible alias.
     def request_cancel(self, job_id: str) -> Job:
         return self.cancel(job_id)
+
+    def mark_cancelled(self, job_id: str) -> Job:
+        """Move a job to CANCELLED. Called by the worker once it has stopped.
+
+        No-op for jobs that are already terminal, so CANCELLED can never be
+        overwritten and a finished job can never become CANCELLED.
+        """
+
+        job = self.require_job(job_id)
+
+        if job.is_terminal():
+            return job
+
+        job.cancel_requested = True
+        self.set_status(job_id, JobStatus.CANCELLED)
+
+        logger.info("Job %s cancelled", job_id)
+
+        return job
 
     def is_cancel_requested(self, job_id: str) -> bool:
         return self.require_job(job_id).cancel_requested
@@ -800,8 +780,6 @@ class JobManager:
 
     def remove_job(self, job_id: str) -> Optional[Job]:
         job = self._jobs.pop(job_id, None)
-
-        self.remove_from_queue(job_id)
 
         return job
 
