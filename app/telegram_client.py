@@ -1,7 +1,7 @@
 """Telegram userbot integration.
 
-This module owns the Telethon userbot client, authentication state,
-message handlers, and Telegram-facing job submission.
+Handles Telegram authentication, owner-only message processing,
+ZIP job creation, and communication with the processing pipeline.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ __all__ = ["TelegramUserbot"]
 
 
 class TelegramUserbot:
-    """Telegram userbot wrapper used by the media-processing pipeline."""
+    """Telegram userbot wrapper."""
 
     def __init__(
         self,
@@ -53,15 +53,12 @@ class TelegramUserbot:
     # ------------------------------------------------------------------ #
 
     async def start(self) -> None:
-        """Connect the userbot.
+        """Connect without interactive phone/OTP login.
 
-        Authentication is intentionally non-interactive.
+        If the session is already authorized, initialize the owner
+        immediately.
 
-        If the Telethon session is already authorized, the authenticated
-        account is initialized immediately.
-
-        If it is not authorized, the QR login bot is responsible for
-        completing authentication.
+        If not authorized, the QR login bot will complete authentication.
         """
 
         logger.info("Telegram client starting")
@@ -79,13 +76,14 @@ class TelegramUserbot:
 
         if me is None:
             raise RuntimeError(
-                "Telegram session is authorized but get_me() returned None"
+                "Telegram session is authorized but account information "
+                "could not be loaded"
             )
 
         self.finish_authenticated_account(me)
 
     def finish_authenticated_account(self, me) -> None:
-        """Finalize userbot setup after successful authentication."""
+        """Finalize the userbot after successful authentication."""
 
         self.owner_id = int(me.id)
         self.owner_username = getattr(me, "username", None)
@@ -104,8 +102,8 @@ class TelegramUserbot:
             and int(configured_owner_id) != self.owner_id
         ):
             logger.warning(
-                "OWNER_ID does not match authenticated Telegram account: "
-                "configured=%s authenticated=%s",
+                "Configured OWNER_ID (%s) does not match "
+                "authenticated account (%s)",
                 configured_owner_id,
                 self.owner_id,
             )
@@ -121,11 +119,11 @@ class TelegramUserbot:
         logger.info("Telegram client stopped")
 
     # ------------------------------------------------------------------ #
-    # Event registration
+    # Telegram handlers
     # ------------------------------------------------------------------ #
 
     def register_handlers(self) -> None:
-        """Register Telegram message handlers exactly once."""
+        """Register Telegram handlers once."""
 
         if self._handlers_registered:
             return
@@ -133,7 +131,7 @@ class TelegramUserbot:
         self._handlers_registered = True
 
         @self.client.on(events.NewMessage(outgoing=True))
-        async def outgoing_handler(event: events.NewMessage.Event) -> None:
+        async def outgoing_handler(event) -> None:
             await self._handle_message(event)
 
         @self.client.on(
@@ -142,16 +140,13 @@ class TelegramUserbot:
                 func=lambda event: event.is_private,
             )
         )
-        async def incoming_handler(event: events.NewMessage.Event) -> None:
+        async def incoming_handler(event) -> None:
             await self._handle_message(event)
 
         logger.info("Telegram message handlers registered")
 
-    async def _handle_message(
-        self,
-        event: events.NewMessage.Event,
-    ) -> None:
-        """Route an incoming/outgoing Telegram message."""
+    async def _handle_message(self, event) -> None:
+        """Handle owner Telegram messages."""
 
         if not self.is_owner_message(event):
             return
@@ -163,55 +158,52 @@ class TelegramUserbot:
 
         text = (message.raw_text or "").strip()
 
-        if not text:
-            if message.document:
-                await self.handle_zip(message)
+        # ZIP/document without useful text.
+        if not text and message.document:
+            await self.handle_zip(message)
             return
 
-        command = text.split(maxsplit=1)[0].lower()
+        if text:
+            command = text.split(maxsplit=1)[0].lower()
 
-        if command == "/ping":
-            await event.reply("🏓 pong")
-            logger.info("Handled /ping")
-            return
+            if command == "/ping":
+                await event.reply("🏓 pong")
+                logger.info("Handled /ping")
+                return
 
-        if command == "/start":
-            await event.reply(
-                "🤖 Media Processor\n\n"
-                "Send a ZIP file to start processing.\n"
-                "Use /status to check jobs.\n"
-                "Use /cancel <job_id> to cancel a queued job."
-            )
-            logger.info("Handled /start")
-            return
+            if command == "/start":
+                await event.reply(
+                    "🤖 Media Processor\n\n"
+                    "Send a ZIP file to start processing.\n"
+                    "Use /status to check jobs.\n"
+                    "Use /cancel <job_id> to cancel a job."
+                )
+                logger.info("Handled /start")
+                return
 
-        if command == "/status":
-            await self.handle_status(event)
-            return
+            if command == "/status":
+                await self.handle_status(event)
+                return
 
-        if command == "/cancel":
-            await self.handle_cancel(event, text)
-            return
+            if command == "/cancel":
+                await self.handle_cancel(event, text)
+                return
 
-        # A ZIP may arrive with a caption. If the message contains a
-        # document, let the ZIP handler inspect the filename/MIME type.
+        # ZIP with caption or other text.
         if message.document:
             await self.handle_zip(message)
 
     # ------------------------------------------------------------------ #
-    # Authorization
+    # Owner check
     # ------------------------------------------------------------------ #
 
-    def is_owner_message(
-        self,
-        event: events.NewMessage.Event,
-    ) -> bool:
-        """Return True only for the authenticated owner account."""
+    def is_owner_message(self, event) -> bool:
+        """Return True only for messages belonging to the owner."""
 
         if self.owner_id is None:
             return False
 
-        # Outgoing messages are generated by the authenticated account.
+        # Outgoing messages originate from the authenticated account.
         if event.out:
             return True
 
@@ -226,87 +218,99 @@ class TelegramUserbot:
     # Commands
     # ------------------------------------------------------------------ #
 
-    async def handle_status(
-        self,
-        event: events.NewMessage.Event,
-    ) -> None:
-        """Show current processor status."""
+    async def handle_status(self, event) -> None:
+        """Show current job status."""
 
         try:
             status = self.job_manager.status()
         except AttributeError:
-            # Compatibility fallback if JobManager exposes a different
-            # status API in an older revision.
+            logger.exception("JobManager status() is unavailable")
+
             await event.reply(
-                "📊 Status unavailable right now."
+                "📊 Status is currently unavailable."
             )
             return
 
-        queued = status.get("queued", 0)
-        running = status.get("running", 0)
-        completed = status.get("completed", 0)
-        failed = status.get("failed", 0)
-        cancelled = status.get("cancelled", 0)
+        if isinstance(status, dict):
+            lines = [
+                "📊 Media Processor Status",
+                "",
+            ]
 
-        await event.reply(
-            "📊 Media Processor Status\n\n"
-            f"Queued: {queued}\n"
-            f"Running: {running}\n"
-            f"Completed: {completed}\n"
-            f"Failed: {failed}\n"
-            f"Cancelled: {cancelled}"
-        )
+            for key, value in status.items():
+                lines.append(
+                    f"{str(key).replace('_', ' ').title()}: {value}"
+                )
+
+            await event.reply("\n".join(lines))
+
+        else:
+            await event.reply(
+                "📊 Media Processor Status\n\n"
+                f"{status}"
+            )
 
         logger.info("Handled /status")
 
     async def handle_cancel(
         self,
-        event: events.NewMessage.Event,
+        event,
         text: str,
     ) -> None:
-        """Cancel a job by ID."""
+        """Cancel a job using its job ID."""
 
         parts = text.split(maxsplit=1)
 
-        if len(parts) != 2 or not parts[1].strip():
+        if len(parts) != 2:
             await event.reply(
                 "Usage:\n"
-                "`/cancel <job_id>`"
+                "/cancel <job_id>"
             )
             return
 
         job_id = parts[1].strip()
 
-        try:
-            cancelled = self.job_manager.cancel(job_id)
-        except AttributeError:
+        if not job_id:
             await event.reply(
-                "❌ Job cancellation is unavailable right now."
+                "Usage:\n"
+                "/cancel <job_id>"
             )
             return
 
-        if cancelled:
-            await event.reply(
-                f"🛑 Job `{job_id}` cancellation requested."
+        try:
+            result = self.job_manager.cancel(job_id)
+        except Exception:
+            logger.exception(
+                "Failed to cancel job %s",
+                job_id,
             )
+
+            await event.reply(
+                f"❌ Could not cancel job `{job_id}`."
+            )
+            return
+
+        if result:
+            await event.reply(
+                f"🛑 Cancellation requested for job `{job_id}`."
+            )
+
             logger.info(
                 "Job cancellation requested: %s",
                 job_id,
             )
         else:
             await event.reply(
-                f"❌ Job `{job_id}` was not found or cannot be cancelled."
+                f"❌ Job `{job_id}` was not found "
+                "or cannot be cancelled."
             )
 
     # ------------------------------------------------------------------ #
-    # ZIP handling
+    # ZIP processing
     # ------------------------------------------------------------------ #
 
-    async def handle_zip(
-        self,
-        message: Message,
-    ) -> None:
-        """Validate a Telegram document and submit it as a processing job."""
+    async def handle_zip(self, message: Message) -> None:
+        """Validate and submit a ZIP document."""
 
         if not message.document:
             return
@@ -329,6 +333,7 @@ class TelegramUserbot:
             await message.reply(
                 "❌ Please send a ZIP archive."
             )
+
             logger.info(
                 "Rejected non-ZIP document: filename=%s mime=%s",
                 filename,
@@ -337,12 +342,18 @@ class TelegramUserbot:
             return
 
         try:
-            job = await self.job_manager.create_job(
+            # JobManager.create_job() is synchronous in the existing
+            # Part 1 architecture.
+            job = self.job_manager.create_job(
                 telegram_message_id=message.id,
                 filename=filename,
             )
+
         except Exception:
-            logger.exception("Failed to create processing job")
+            logger.exception(
+                "Failed to create job for Telegram message %s",
+                message.id,
+            )
 
             await message.reply(
                 "❌ Could not create a processing job."
@@ -356,28 +367,28 @@ class TelegramUserbot:
         )
 
         try:
-            await self.job_manager.start_progress(job.job_id)
+            # Existing JobManager owns its state/queue.
+            self.job_manager.enqueue(
+                job.job_id
+            )
 
-            # Keep the JobManager's queue/state in sync with the
-            # pipeline submission.
-            await self.job_manager.enqueue(job.job_id)
-
+            # PipelineWorker owns the actual asyncio processing queue.
             await self.pipeline.submit(job)
 
         except Exception:
             logger.exception(
-                "Failed to submit job: %s",
+                "Failed to submit job %s",
                 job.job_id,
             )
 
             try:
-                await self.job_manager.mark_failed(
+                self.job_manager.fail(
                     job.job_id,
                     "Failed to submit processing job",
                 )
             except Exception:
                 logger.exception(
-                    "Failed to mark submission failure: %s",
+                    "Failed to mark job %s as failed",
                     job.job_id,
                 )
 
@@ -394,10 +405,8 @@ class TelegramUserbot:
         )
 
     @staticmethod
-    def _document_filename(
-        message: Message,
-    ) -> str:
-        """Extract a safe display filename from a Telegram document."""
+    def _document_filename(message: Message) -> str:
+        """Get a safe filename from a Telegram document."""
 
         document = message.document
 
