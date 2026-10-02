@@ -163,9 +163,11 @@ class ProgressRenderer:
             failures
         )
 
+        skipped_images = self._skipped_large_count(job)
+
         if image_count:
             completed_images = min(
-                successful_images + failed_images,
+                successful_images + failed_images + skipped_images,
                 image_count,
             )
 
@@ -186,13 +188,19 @@ class ProgressRenderer:
                     f"{failed_images}"
                 )
 
+            if skipped_images:
+                lines.append(
+                    f"⏭️ Skipped (over 2 MiB): "
+                    f"{skipped_images}"
+                )
+
         if video_count:
             lines.extend(
                 [
                     "",
                     f"🎬 Videos detected: {video_count}",
-                    "⏳ Videos will be processed by "
-                    "the target Telegram bot in Part 3.",
+                    "⏳ Videos are reserved for Part 3 "
+                    "(target Telegram bot, not implemented yet).",
                 ]
             )
 
@@ -227,6 +235,16 @@ class ProgressRenderer:
                 self._render_upload_results(results)
             )
 
+        skipped_images = self._skipped_large_count(job)
+
+        if skipped_images:
+            lines.extend(
+                [
+                    "",
+                    f"⏭️ <b>Skipped (over 2 MiB):</b> {skipped_images}",
+                ]
+            )
+
         video_count = self._int_value(
             job,
             "video_count",
@@ -237,8 +255,8 @@ class ProgressRenderer:
                 [
                     "",
                     f"🎬 <b>Videos detected:</b> {video_count}",
-                    "⏳ Video processing will be handled "
-                    "by the target bot in Part 3.",
+                    "⏳ Videos are reserved for Part 3 "
+                    "(not processed in Part 2).",
                 ]
             )
 
@@ -438,6 +456,14 @@ class ProgressRenderer:
     # ------------------------------------------------------------------
     # COUNTING
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _skipped_large_count(job: Job) -> int:
+        """Images intentionally skipped for exceeding the Part 2 limit."""
+
+        metadata = getattr(job, "metadata", None) or {}
+
+        return len(metadata.get("part2_skipped_large_images") or [])
 
     @staticmethod
     def _count_successful_images(
