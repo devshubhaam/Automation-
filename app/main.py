@@ -16,6 +16,44 @@ from .telegram_client import TelegramUserbot
 
 logger = logging.getLogger("app.main")
 
+HEALTH_HOST = "0.0.0.0"
+HEALTH_PORT = 8000
+
+
+async def _health_handler(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    """Return a minimal HTTP health response."""
+    try:
+        await reader.read(1024)
+
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "OK"
+        )
+
+        writer.write(response.encode("ascii"))
+        await writer.drain()
+
+    except Exception:
+        logger.debug(
+            "Health connection handling failed",
+            exc_info=True,
+        )
+
+    finally:
+        writer.close()
+
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
 
 class PipelineWorker:
     """Background worker for Part 1 archive processing."""
@@ -96,13 +134,16 @@ class PipelineWorker:
 
                 try:
                     await self._process(job)
+
                 except asyncio.CancelledError:
                     raise
+
                 except Exception:
                     logger.exception(
                         "Unhandled error processing job %s",
                         getattr(job, "job_id", "unknown"),
                     )
+
                 finally:
                     self._queue.task_done()
 
@@ -125,7 +166,6 @@ class PipelineWorker:
         job_id = job.job_id
 
         try:
-            # A queued job can be cancelled before its worker starts.
             if job.cancel_requested:
                 logger.info(
                     "Job %s was cancelled before processing started",
@@ -252,7 +292,10 @@ class PipelineWorker:
             try:
                 current = self.job_manager.get(job_id)
 
-                if current.cancel_requested and not current.is_terminal:
+                if (
+                    current.cancel_requested
+                    and not current.is_terminal
+                ):
                     self.job_manager.cancel(job_id)
 
                 elif not current.is_terminal:
@@ -323,7 +366,35 @@ class Application:
         self.userbot: Optional[TelegramUserbot] = None
         self.login_bot: Optional[LoginBot] = None
 
+        self.health_server: Optional[asyncio.AbstractServer] = None
+
         self._stop_event = asyncio.Event()
+
+    async def start_health_server(self) -> None:
+        """Start the HTTP health server for Koyeb."""
+        self.health_server = await asyncio.start_server(
+            _health_handler,
+            HEALTH_HOST,
+            HEALTH_PORT,
+        )
+
+        logger.info(
+            "Health server listening on %s:%s",
+            HEALTH_HOST,
+            HEALTH_PORT,
+        )
+
+    async def stop_health_server(self) -> None:
+        """Stop the Koyeb health server."""
+        if self.health_server is None:
+            return
+
+        self.health_server.close()
+        await self.health_server.wait_closed()
+
+        self.health_server = None
+
+        logger.info("Health server stopped")
 
     async def start(self) -> None:
         """Start the complete application."""
@@ -332,6 +403,8 @@ class Application:
         )
 
         self.settings.ensure_directories()
+
+        await self.start_health_server()
 
         self.job_manager = JobManager(
             self.settings.job_dir,
@@ -402,6 +475,7 @@ class Application:
 
         try:
             await self._stop_event.wait()
+
         finally:
             await self.stop()
 
@@ -419,6 +493,8 @@ class Application:
 
         if self.userbot is not None:
             await self.userbot.stop()
+
+        await self.stop_health_server()
 
         logger.info(
             "Telegram Media Processor stopped"
@@ -483,7 +559,6 @@ def main() -> None:
             "Application terminated unexpectedly"
         )
         raise
-
 
 if __name__ == "__main__":
     main()
