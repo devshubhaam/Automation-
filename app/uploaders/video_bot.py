@@ -21,8 +21,11 @@ from .common import UploadCancelled, UploadError
 
 logger = logging.getLogger("app.video_bot")
 
-#: Default: the first http(s) link in the bot's reply.
-DEFAULT_URL_PATTERN = r"https?://[^\s<>\"')\]]+"
+#: Default: a link whose path is ``/app/<id>`` or ``/s/<id>`` on any domain, e.g.
+#:   https://www.domain.com/app/6abfae122a52418b24707585
+#:   https://domain.com/s/dauv7n9bjlnn77sqlrogow6-ryxopea
+#: Other links in the bot's reply (channel ads, help links) are ignored.
+DEFAULT_URL_PATTERN = r"https?://[^\s/<>\"')\]]+/(?:app|s)/[A-Za-z0-9_-]+"
 
 __all__ = ["VideoBotUploader", "extract_url", "normalise_username"]
 
