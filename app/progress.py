@@ -2,11 +2,44 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import string
 
-from typing import Any, Iterable
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
 from .job_manager import Job, JobStatus
+
+logger = logging.getLogger(__name__)
+
+#: Placeholders supported by ``FINAL_POST_TEMPLATE``.
+FINAL_POST_VARIABLES = (
+    "telegraph_url",
+    "video_links",
+    "title",
+    "archive_name",
+    "video_count",
+    "image_count",
+    "job_id",
+)
+
+
+def normalize_final_post_template(value: Optional[str]) -> Optional[str]:
+    """Prepare a raw ``FINAL_POST_TEMPLATE`` value for rendering.
+
+    Escaped ``\\n`` sequences (as typed into a RAW environment editor) become
+    real newlines and CRLF is normalised. Empty / whitespace-only values mean
+    "not configured" and return ``None``.
+    """
+
+    if value is None:
+        return None
+
+    text = str(value).replace("\\r\\n", "\n").replace("\\n", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    return text if text.strip() else None
 
 
 class ProgressRenderer:
@@ -37,6 +70,12 @@ class ProgressRenderer:
         JobStatus.FAILED: "Failed",
         JobStatus.CANCELLED: "Cancelled",
     }
+
+    def __init__(self, final_post_template: Optional[str] = None) -> None:
+        # ``None`` / empty -> the built-in clean final post.
+        self.final_post_template = normalize_final_post_template(
+            final_post_template
+        )
 
     def render(self, job: Job) -> str:
         """Render the current state of a job."""
@@ -424,6 +463,20 @@ class ProgressRenderer:
         if not telegraph_url and not video_urls:
             return None
 
+        if self.final_post_template:
+            custom = self._render_custom_final(
+                job, results, telegraph_url, video_urls
+            )
+            if custom is not None:
+                return custom
+
+        return self._build_default_clean(telegraph_url, video_urls)
+
+    def _build_default_clean(
+        self, telegraph_url: str, video_urls: list[str]
+    ) -> str:
+        """The built-in clean final post (used when no template is set)."""
+
         head: list[str] = []
         if telegraph_url:
             head.extend(["📝 Telegraph", self._escape(telegraph_url)])
@@ -445,6 +498,93 @@ class ProgressRenderer:
         while count > 0 and len(text) > self.MAX_MESSAGE_CHARS:
             count -= 1
             text = build(count)
+        return text
+
+    def _render_custom_final(
+        self,
+        job: Job,
+        results: list[Any],
+        telegraph_url: str,
+        video_urls: list[str],
+    ) -> str | None:
+        """Render ``FINAL_POST_TEMPLATE``; ``None`` -> use the default post.
+
+        ``video_urls`` is already DiskWala-only, de-duplicated and sorted by
+        the original ``size_bytes`` (descending, stable), so substitution
+        never reorders anything. When the post is too long the links are
+        dropped from the END (smallest videos first). Falls back to the
+        default post for unknown/invalid placeholders or when even the
+        template without links does not fit.
+        """
+
+        template = self.final_post_template or ""
+
+        try:
+            fields = {
+                name
+                for _, name, _, _ in string.Formatter().parse(template)
+                if name is not None
+            }
+        except ValueError as exc:
+            logger.warning(
+                "FINAL_POST_TEMPLATE is malformed (%s); using the default final post.",
+                exc,
+            )
+            return None
+
+        unknown = sorted(fields - set(FINAL_POST_VARIABLES))
+        if unknown:
+            logger.warning(
+                "FINAL_POST_TEMPLATE uses unknown placeholder(s) %s; "
+                "using the default final post. Supported: %s.",
+                ", ".join("{%s}" % name for name in unknown),
+                ", ".join("{%s}" % name for name in FINAL_POST_VARIABLES),
+            )
+            return None
+
+        archive_name = str(getattr(job, "archive_name", "") or "")
+        base_values = {
+            "telegraph_url": self._escape(telegraph_url),
+            "title": self._escape(Path(archive_name).stem or archive_name or "Media"),
+            "archive_name": self._escape(archive_name),
+            "image_count": str(
+                self._count_successful_images(
+                    [r for r in results if self._provider_of(r) == "imgbb"]
+                )
+            ),
+            "job_id": self._escape(str(getattr(job, "job_id", "") or "")),
+        }
+
+        def build(count: int) -> str:
+            values = dict(base_values)
+            values["video_links"] = "\n".join(
+                self._escape(u) for u in video_urls[:count]
+            )
+            values["video_count"] = str(count)
+            return template.format_map(values)
+
+        try:
+            count = len(video_urls)
+            text = build(count)
+            while count > 0 and len(text) > self.MAX_MESSAGE_CHARS:
+                count -= 1
+                text = build(count)
+        except (KeyError, IndexError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "FINAL_POST_TEMPLATE could not be rendered (%s); "
+                "using the default final post.",
+                type(exc).__name__,
+            )
+            return None
+
+        if len(text) > self.MAX_MESSAGE_CHARS:
+            logger.warning(
+                "FINAL_POST_TEMPLATE is longer than %d characters even without "
+                "video links; using the default final post.",
+                self.MAX_MESSAGE_CHARS,
+            )
+            return None
+
         return text
 
     def _render_completed(self, job: Job) -> list[str]:
