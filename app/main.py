@@ -148,6 +148,7 @@ class PipelineWorker:
             max_size_bytes=settings.video_max_size_bytes,
             send_attempts=settings.video_bot_send_attempts,
             fallback_on_timeout=settings.video_bot_fallback_on_timeout,
+            mode=settings.video_bot_mode,
             require_reply=settings.video_bot_require_reply,
         )
 
@@ -702,6 +703,8 @@ class PipelineWorker:
                 "error": None,
                 "bot": None,
                 "provider": None,
+                "links": [],
+                "partial_errors": [],
             }
             for m in videos
         ]
@@ -762,53 +765,90 @@ class PipelineWorker:
 
                 logger.info("Job %s: sending video to video bot(s): %s", job.job_id, filename)
 
+                recorded: set[tuple[str, str]] = set()
+
+                def record_link(link: dict[str, Any]) -> None:
+                    """Store ONE link of this video (one per video bot)."""
+                    url = str(link.get("url") or "")
+                    bot = link.get("bot")
+                    provider = link.get("provider_name")
+                    if not url or (str(bot), url) in recorded:
+                        return
+                    recorded.add((str(bot), url))
+
+                    if any(r["url"] == url for r in results):
+                        logger.warning(
+                            "Job %s: video bot returned the same link for several videos (%s)",
+                            job.job_id,
+                            filename,
+                        )
+
+                    link_extra = dict(extra)
+                    link_extra["bot"] = bot
+                    link_extra["provider_name"] = provider
+                    self.job_manager.add_upload_result(
+                        job.job_id,
+                        UploadResult(
+                            media_type="video",
+                            filename=filename,
+                            provider="video_bot",
+                            url=url,
+                            size_bytes=size,
+                            extra=link_extra,
+                        ),
+                    )
+                    entry["links"].append({"bot": bot, "provider": provider, "url": url})
+                    # First link also fills the legacy single-link fields.
+                    if not entry.get("url"):
+                        entry.update(url=url, bot=bot, provider=provider)
+                    results.append(
+                        {
+                            "filename": filename,
+                            "file": filename,
+                            "relative_path": entry["relative_path"],
+                            "provider": provider,
+                            "bot": bot,
+                            "url": url,
+                            "status": "completed",
+                        }
+                    )
+                    publish_metadata()
+
                 upload_kwargs: dict[str, Any] = {
                     "client": client,
                     "should_cancel": lambda: job.cancel_requested,
                 }
                 if getattr(self.video_uploader, "supports_progress_callback", False):
                     upload_kwargs["on_attempt"] = on_attempt
+                if getattr(self.video_uploader, "supports_link_callback", False):
+                    upload_kwargs["on_link"] = record_link
 
                 response = await self.video_uploader.upload(video_path, **upload_kwargs)
-                url = str(response.get("url", ""))
-                if not url:
+
+                # Uploaders without the link callback only report at the end.
+                response_links = response.get("links")
+                if not response_links:
+                    response_links = [
+                        {
+                            "bot": response.get("bot"),
+                            "provider_name": response.get("provider_name"),
+                            "url": response.get("url"),
+                        }
+                    ]
+                for link in response_links:
+                    record_link(link)
+
+                if not entry["links"]:
                     raise UploadError("Video bot returned no link")
 
-                bot = response.get("bot")
-                provider = response.get("provider_name")
-                extra["bot"] = bot
-                extra["provider_name"] = provider
+                entry.update(status="done", error=None)
 
-                if any(r["url"] == url for r in results):
-                    logger.warning(
-                        "Job %s: video bot returned the same link for several videos (%s)",
-                        job.job_id,
-                        filename,
+                # Some bots failed while others gave a link: report them, keep
+                # the video as successful.
+                for bot_failure in response.get("failures") or []:
+                    self._record_bot_failure(
+                        job, entry, failures, bot_failure, extra
                     )
-
-                self.job_manager.add_upload_result(
-                    job.job_id,
-                    UploadResult(
-                        media_type="video",
-                        filename=filename,
-                        provider="video_bot",
-                        url=url,
-                        size_bytes=size,
-                        extra=extra,
-                    ),
-                )
-                entry.update(status="done", url=url, error=None, bot=bot, provider=provider)
-                results.append(
-                    {
-                        "filename": filename,
-                        "file": filename,
-                        "relative_path": entry["relative_path"],
-                        "provider": provider,
-                        "bot": bot,
-                        "url": url,
-                        "status": "completed",
-                    }
-                )
 
             except UploadCancelled:
                 entry.update(status="cancelled")
@@ -816,7 +856,8 @@ class PipelineWorker:
                 raise JobCancelled()
 
             except asyncio.CancelledError:
-                # Shutdown while this video was in flight.
+                # Shutdown while this video was in flight (links already
+                # received stay stored in the job results).
                 entry.update(status="cancelled")
                 publish_metadata()
                 raise
@@ -849,6 +890,48 @@ class PipelineWorker:
         """Client of the message that started the job (the userbot client)."""
         message = getattr(job, "_telegram_message", None)
         return getattr(message, "client", None) if message is not None else None
+
+    def _record_bot_failure(
+        self,
+        job: Job,
+        entry: dict[str, Any],
+        failures: list[dict[str, Any]],
+        bot_failure: dict[str, Any],
+        extra: dict[str, Any],
+    ) -> None:
+        """One bot failed for a video that still got a link from another bot."""
+        bot = str(bot_failure.get("bot") or "")
+        reason = str(bot_failure.get("reason") or bot_failure.get("kind") or "failed")
+        provider_lookup = getattr(self.video_uploader, "provider_for_bot", None)
+        provider = provider_lookup(bot) if callable(provider_lookup) and bot else None
+
+        entry["partial_errors"].append({"bot": bot, "provider": provider, "error": reason})
+        failures.append(
+            {
+                "filename": entry["filename"],
+                "file": entry["filename"],
+                "relative_path": entry["relative_path"],
+                "provider": provider,
+                "bot": bot,
+                "error": reason,
+                "reason": reason,
+                "status": "partial",
+            }
+        )
+        failure_extra = dict(extra)
+        failure_extra["bot"] = bot
+        failure_extra["provider_name"] = provider
+        failure_extra["partial"] = True
+        self.job_manager.add_upload_failure(
+            job.job_id,
+            UploadFailure(
+                provider="video_bot",
+                media_type="video",
+                filename=entry["filename"],
+                error=f"@{bot}: {reason}" if bot else reason,
+                extra=failure_extra,
+            ),
+        )
 
     def _fail_video(
         self,
