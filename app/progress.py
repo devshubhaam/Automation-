@@ -557,7 +557,7 @@ class ProgressRenderer:
 
         def build(count: int) -> str:
             values = dict(base_values)
-            values["video_links"] = "\n".join(
+            values["video_links"] = "\n\n".join(
                 self._escape(u) for u in video_urls[:count]
             )
             values["video_count"] = str(count)
