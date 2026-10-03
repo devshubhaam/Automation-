@@ -117,7 +117,9 @@ class PipelineWorker:
         self._workers: list[asyncio.Task] = []
         self._stopping = False
 
-        self.progress = ProgressRenderer()
+        self.progress = ProgressRenderer(
+            final_post_template=getattr(settings, "final_post_template", None)
+        )
 
         # Part 2: images go to ImgBB ONLY. Videos must never reach it.
         self.imgbb_uploader = imgbb_uploader or ImgBBUploader(
