@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from app.config import Settings
+from app.config import Settings, resolve_article_title
 from app.job_manager import JobManager, JobStatus, UploadResult
 from app.progress import ProgressRenderer, normalize_final_post_template
 
@@ -22,9 +22,13 @@ def make_job(tmp_path, archive_name="My Album.zip", job_id="job-1"):
     return manager, job
 
 
-def add_article(manager, job, url=TELEGRAPH):
+ARTICLE_TITLE = "TG FindMyGfOG - 3101"  # exact title sent to Telegraph createPage
+
+
+def add_article(manager, job, url=TELEGRAPH, title=ARTICLE_TITLE):
+    # The pipeline stores the Telegraph article title in ``filename``.
     manager.add_upload_result(job.job_id, UploadResult(
-        media_type="article", filename="album", provider="telegraph_article", url=url))
+        media_type="article", filename=title, provider="telegraph_article", url=url))
 
 
 def add_video(manager, job, name, size, url, provider="diskwala"):
@@ -38,11 +42,11 @@ def add_image(manager, job, name="i.jpg", url="https://i.ibb.co/i.jpg"):
         media_type="image", filename=name, provider="imgbb", url=url))
 
 
-def finished(tmp_path, videos, *, article=True, images=0, **job_kwargs):
+def finished(tmp_path, videos, *, article=True, images=0, article_title=ARTICLE_TITLE, **job_kwargs):
     """videos: (filename, size, url[, provider]) in upload-COMPLETION order."""
     manager, job = make_job(tmp_path, **job_kwargs)
     if article:
-        add_article(manager, job)
+        add_article(manager, job, title=article_title)
     for video in videos:
         add_video(manager, job, *video)
     for i in range(images):
@@ -77,7 +81,7 @@ def test_second_example_template_with_title(tmp_path):
     job = finished(tmp_path, ABCD[:2])
     template = "📦 {title}\n\n🔗 Telegraph:\n{telegraph_url}\n\n🎬 Videos:\n{video_links}"
     assert render(job, template) == (
-        f"📦 My Album\n\n🔗 Telegraph:\n{TELEGRAPH}\n\n🎬 Videos:\n{DISK}B\n\n{DISK}A"
+        f"📦 {ARTICLE_TITLE}\n\n🔗 Telegraph:\n{TELEGRAPH}\n\n🎬 Videos:\n{DISK}B\n\n{DISK}A"
     )
 
 
@@ -90,7 +94,7 @@ def test_every_supported_variable(tmp_path):
         "{video_count}|{image_count}|{job_id}"
     )
     assert render(job, template) == (
-        f"{TELEGRAPH}|{DISK}B\n\n{DISK}A\n\n{DISK}C\n\n{DISK}D|My Album|My Album.zip|4|3|job-1"
+        f"{TELEGRAPH}|{DISK}B\n\n{DISK}A\n\n{DISK}C\n\n{DISK}D|{ARTICLE_TITLE}|My Album.zip|4|3|job-1"
     )
 
 
@@ -100,7 +104,7 @@ def test_missing_telegraph_is_empty_string(tmp_path):
 
 
 def test_values_are_html_escaped_but_template_text_is_kept(tmp_path):
-    job = finished(tmp_path, [("a.mp4", 1, DISK + "X&Y")], archive_name="A<b>&.zip")
+    job = finished(tmp_path, [("a.mp4", 1, DISK + "X&Y")], article_title="A<b>&")
     assert render(job, "<b>{title}</b>\n{video_links}") == f"<b>A&lt;b&gt;&amp;</b>\n{DISK}X&amp;Y"
 
 
@@ -271,3 +275,69 @@ def test_blank_line_format_keeps_sorting_stability_and_filtering(tmp_path):
         ("f.mp4", 800, "https://flezen.com/s/F", "flezen"),
     ])
     assert render(job, "{video_links}") == f"{DISK}B\n\n{DISK}A\n\n{DISK}C"
+
+
+# {title} = Telegraph article title -------------------------------------------
+
+def test_title_is_telegraph_article_title(tmp_path):
+    job = finished(tmp_path, ABCD[:1], archive_name="Some Archive.zip")
+    assert render(job, "{title}") == "TG FindMyGfOG - 3101"
+
+
+def test_title_is_not_archive_filename(tmp_path):
+    job = finished(tmp_path, ABCD[:1], archive_name="secret_archive_name.zip")
+    text = render(job, "{title}|{archive_name}")
+    title, archive = text.split("|")
+    assert title == ARTICLE_TITLE
+    assert "secret_archive_name" not in title and ".zip" not in title
+    assert archive == "secret_archive_name.zip"  # {archive_name} unchanged
+
+
+def test_title_in_custom_template_with_other_variables_unchanged(tmp_path):
+    job = finished(tmp_path, ABCD, images=2, archive_name="x.zip")
+    template = "📦 {title}\n{telegraph_url}\n{video_links}\n{video_count}/{image_count}/{job_id}"
+    assert render(job, template) == (
+        f"📦 {ARTICLE_TITLE}\n{TELEGRAPH}\n"
+        f"{DISK}B\n\n{DISK}A\n\n{DISK}C\n\n{DISK}D\n4/2/job-1"
+    )
+
+
+def test_title_empty_without_article_not_archive_name(tmp_path):
+    job = finished(tmp_path, ABCD[:1], article=False, archive_name="x.zip")
+    assert render(job, "[{title}]\n{video_links}") == f"[]\n{DISK}A"
+
+
+def test_title_uses_title_of_the_article_whose_url_is_posted(tmp_path):
+    manager, job = make_job(tmp_path)
+    add_article(manager, job, url=TELEGRAPH, title="Album (Part 1)")
+    add_article(manager, job, url=TELEGRAPH + "-2", title="Album (Part 2)")
+    add_video(manager, job, "a.mp4", 1, DISK + "A")
+    manager.complete(job.job_id)
+    assert render(job, "{title}\n{telegraph_url}") == f"Album (Part 1)\n{TELEGRAPH}"
+
+
+# TELEGRAPH_TITLE (fixed article title) --------------------------------------
+
+def test_resolve_article_title_uses_fixed_title_from_env():
+    assert resolve_article_title("  TG FindMyGfOG - 3101 ", "Whatever.zip") == "TG FindMyGfOG - 3101"
+
+
+def test_resolve_article_title_falls_back_to_archive_stem():
+    assert resolve_article_title(None, "My Album.zip") == "My Album"
+    assert resolve_article_title("   ", "My Album.zip") == "My Album"
+    assert resolve_article_title("", "") == "Media"
+
+
+def test_settings_reads_telegraph_title_from_env(monkeypatch):
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "0123456789abcdef")
+    monkeypatch.setenv("TELEGRAPH_TITLE", "TG FindMyGfOG - 3101")
+    assert Settings.from_env(env_file=None).telegraph_title == "TG FindMyGfOG - 3101"
+    monkeypatch.delenv("TELEGRAPH_TITLE")
+    assert Settings.from_env(env_file=None).telegraph_title is None
+
+
+def test_fixed_title_flows_into_title_variable_not_archive_name(tmp_path):
+    fixed = resolve_article_title("TG FindMyGfOG - 3101", "secret_archive.zip")
+    job = finished(tmp_path, ABCD[:1], article_title=fixed, archive_name="secret_archive.zip")
+    assert render(job, "{title}|{archive_name}") == "TG FindMyGfOG - 3101|secret_archive.zip"
