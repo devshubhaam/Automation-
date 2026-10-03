@@ -131,6 +131,7 @@ def multi(bots=(DISK, FLEZEN), **kw) -> MultiVideoBotUploader:
     kw.setdefault("retry_delay_seconds", 0)
     kw.setdefault("send_attempts", 1)
     kw.setdefault("timeout_seconds", 0.2)
+    kw.setdefault("mode", "fallback")  # Part 3 tests cover the fallback policy
     return MultiVideoBotUploader(list(bots), **kw)
 
 
@@ -750,7 +751,7 @@ async def test_progress_shows_the_active_bot_and_the_provider(settings, tmp_path
     manager.complete(job.job_id)
     final = ProgressRenderer().render(job)
     assert "https://flezen.com/s/FZ-one" in final
-    assert "(Flezen)" in final
+    assert "Flezen: https://flezen.com/s/FZ-one" in final
     assert "imgbb" not in final.lower()  # a video link is never an ImgBB link
 
 
