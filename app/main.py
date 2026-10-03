@@ -291,7 +291,7 @@ class PipelineWorker:
         self,
         job: Job,
     ) -> None:
-        """Run the Part 1 + Part 2 pipeline for one job."""
+        """Run the full pipeline (ZIP -> images + videos) for one job."""
 
         job_id = job.job_id
 
@@ -441,7 +441,22 @@ class PipelineWorker:
             await self._notify(job)
 
         except asyncio.CancelledError:
+            # Application shutdown (the worker task is being cancelled). The
+            # job is marked CANCELLED and the single status message is edited
+            # one last time, then the cancellation propagates. Temporary video
+            # bot handlers were already removed by the uploader's ``finally``.
             logger.info("Job %s: processing task cancelled", job_id)
+            try:
+                if not job.is_terminal():
+                    self.job_manager.set_metadata(
+                        job_id, "cancel_reason", "application shutdown"
+                    )
+                    self.job_manager.mark_cancelled(job_id)
+                await asyncio.wait_for(self._notify(job), timeout=5)
+            except BaseException:  # noqa: BLE001 - best effort, never block shutdown
+                logger.debug(
+                    "Job %s: could not publish shutdown state", job_id, exc_info=True
+                )
             raise
 
         except Exception as exc:
@@ -800,6 +815,12 @@ class PipelineWorker:
                 publish_metadata()
                 raise JobCancelled()
 
+            except asyncio.CancelledError:
+                # Shutdown while this video was in flight.
+                entry.update(status="cancelled")
+                publish_metadata()
+                raise
+
             except UploadError as exc:
                 logger.warning("Job %s: video bot failed for %s: %s", job.job_id, filename, exc)
                 self._fail_video(job, entry, failures, str(exc), extra, exc)
@@ -1029,7 +1050,13 @@ class PipelineWorker:
         self,
         job: Job,
     ) -> None:
-        """Edit the Telegram status message."""
+        """Edit the Telegram status message (the single progress/final message).
+
+        Link previews are disabled so many URLs do not flood the chat. If the
+        edit of a FINAL (terminal) message fails, a compact copy is sent as a
+        reply so the person still gets the result. Telegram errors never stop
+        the media pipeline.
+        """
 
         status_message = getattr(
             job,
@@ -1048,12 +1075,34 @@ class PipelineWorker:
             await status_message.edit(
                 text,
                 parse_mode="html",
+                link_preview=False,
             )
+            return
+
+        except asyncio.CancelledError:
+            raise
 
         except Exception:
-            # Telegram edit errors must never kill the media pipeline.
             logger.debug(
                 "Could not update progress message for job %s",
+                job.job_id,
+                exc_info=True,
+            )
+
+        if not job.is_terminal():
+            return
+
+        try:
+            await status_message.reply(
+                self.progress.render(job)[: self.progress.MAX_MESSAGE_CHARS],
+                parse_mode="html",
+                link_preview=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Could not send final message for job %s",
                 job.job_id,
                 exc_info=True,
             )
@@ -1178,18 +1227,22 @@ class Application:
                 "Login bot shutdown failed"
             )
 
-        try:
-            await self.userbot.stop()
-        except Exception:
-            logger.exception(
-                "Userbot shutdown failed"
-            )
-
+        # The pipeline stops BEFORE the userbot: running jobs are cancelled
+        # (temporary video-bot handlers removed, final message edited) while
+        # the Telegram client is still connected.
         try:
             await self.pipeline.stop()
         except Exception:
             logger.exception(
                 "Pipeline shutdown failed"
+            )
+
+        # Persists/closes the session exactly as before (unchanged).
+        try:
+            await self.userbot.stop()
+        except Exception:
+            logger.exception(
+                "Userbot shutdown failed"
             )
 
         logger.info(
@@ -1280,7 +1333,7 @@ async def async_main() -> None:
     )
 
     logger.info(
-        "Starting Telegram Media Processor (PART 2)"
+        "Starting Telegram Media Processor"
     )
 
     application = Application(
