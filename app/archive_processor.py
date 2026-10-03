@@ -125,10 +125,30 @@ def _is_regular_or_unknown(member: zipfile.ZipInfo) -> bool:
     return stat.S_ISREG(mode)
 
 
+def _fix_member_names(infos: List[zipfile.ZipInfo]) -> List[zipfile.ZipInfo]:
+    """Repair member names written as raw UTF-8 without the ZIP UTF-8 flag.
+
+    Phones/zip tools often store UTF-8 names without setting flag bit 0x800;
+    ``zipfile`` then decodes them as cp437 and emoji/non-ASCII names come out
+    garbled (e.g. ``≡ƒÿ¡``). Re-decoding as UTF-8 restores them. Names that
+    are not valid UTF-8 stay unchanged. ``orig_filename`` (which ``zipfile``
+    uses to verify the local header) is not touched.
+    """
+    for info in infos:
+        if info.flag_bits & 0x800:
+            continue
+        try:
+            fixed = info.filename.encode("cp437").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        info.filename = fixed
+    return infos
+
+
 def iter_member_names(archive_path: Path) -> List[str]:
     """Return every member name in the archive (names only, nothing extracted)."""
     with zipfile.ZipFile(archive_path) as archive:
-        return [info.filename for info in archive.infolist()]
+        return [info.filename for info in _fix_member_names(archive.infolist())]
 
 
 def validate_archive(archive_path: Path, settings: Settings) -> ArchiveInfo:
@@ -158,7 +178,7 @@ def validate_archive(archive_path: Path, settings: Settings) -> ArchiveInfo:
 
     try:
         with zipfile.ZipFile(archive_path) as archive:
-            infos = archive.infolist()
+            infos = _fix_member_names(archive.infolist())
             if not infos:
                 return ArchiveInfo(
                     path=archive_path,
@@ -258,7 +278,7 @@ def safe_extract(
 
     try:
         with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.infolist():
+            for member in _fix_member_names(archive.infolist()):
                 if should_cancel is not None and should_cancel():
                     raise ExtractionCancelledError("extraction cancelled by user")
 
