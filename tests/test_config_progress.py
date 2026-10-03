@@ -189,9 +189,9 @@ class TestProgressRenderer:
         )
         manager.complete(job.job_id)
         text = ProgressRenderer().render(job)
-        assert "Telegraph article" in text and "https://telegra.ph/a-10-03" in text
-        assert "https://i.ibb.co/a.jpg" in text
-        assert text.index("https://telegra.ph/a-10-03") < text.index("https://i.ibb.co/a.jpg")
+        # Clean final post: Telegraph link only, no ImgBB links, no header/counts.
+        assert text == "📝 Telegraph\nhttps://telegra.ph/a-10-03"
+        assert "ibb.co" not in text
 
     def test_completed_lists_video_links(self, tmp_path):
         manager, job = make_job(tmp_path)
