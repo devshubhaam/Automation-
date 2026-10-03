@@ -91,6 +91,14 @@ class FakeMessage:
         return file
 
 
+def assert_subset(actual: list[dict[str, Any]], expected: list[dict[str, Any]]) -> None:
+    """Every expected key/value must be present (entries may carry extra fields,
+    e.g. ``file``/``provider``/``bot``/``status``/``reason`` added in Part 3)."""
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        assert {k: got.get(k) for k in want} == want
+
+
 def make_worker(settings: Settings, imgbb=None, telegraph=None, video=None):
     manager = JobManager(settings.job_dir)
     imgbb = imgbb or FakeImgBB()
@@ -236,8 +244,8 @@ async def test_images_plus_videos_telegraph_gets_only_image_urls(settings, tmp_p
     sent = json.dumps(telegraph.calls)
     assert "domain.com" not in sent and "v.mp4" not in sent
     assert job.metadata["telegraph_articles"] == ["https://telegra.ph/album"]
-    assert job.metadata["video_results"] == [
-        {"filename": "v.mp4", "relative_path": "v.mp4", "url": "https://www.domain.com/app/V"}]
+    assert_subset(job.metadata["video_results"], [
+        {"filename": "v.mp4", "relative_path": "v.mp4", "url": "https://www.domain.com/app/V"}])
 
 
 def test_no_video_to_telegraph_code_is_left():
@@ -312,8 +320,8 @@ async def test_one_failing_video_does_not_affect_the_others(settings, tmp_path):
 
     assert [p.name for p in video.calls] == ["v1.mp4", "v2.mp4", "v3.mp4"]
     assert [r["filename"] for r in job.metadata["video_results"]] == ["v1.mp4", "v3.mp4"]
-    assert job.metadata["video_failures"] == [
-        {"filename": "v2.mp4", "relative_path": "v2.mp4", "error": "bot exploded"}]
+    assert_subset(job.metadata["video_failures"], [
+        {"filename": "v2.mp4", "relative_path": "v2.mp4", "error": "bot exploded"}])
     assert [(s["filename"], s["status"]) for s in job.metadata["video_status"]] == [
         ("v1.mp4", "done"), ("v2.mp4", "failed"), ("v3.mp4", "done")]
 
@@ -756,7 +764,7 @@ async def test_metadata_exposes_everything_and_is_json_serialisable(settings, tm
     assert md["telegraph_articles"] == ["https://telegra.ph/album"]
     assert md["video_processing"] == "video_bot"
     assert md["video_results"][0]["filename"] == "ok.mp4"
-    assert md["video_failures"][0] == {"filename": "bad.mp4", "relative_path": "bad.mp4", "error": "timeout"}
+    assert_subset(md["video_failures"][:1], [{"filename": "bad.mp4", "relative_path": "bad.mp4", "error": "timeout"}])
     assert {s["filename"]: s["status"] for s in md["video_status"]} == {"ok.mp4": "done", "bad.mp4": "failed"}
     json.dumps(job.to_dict())
 
