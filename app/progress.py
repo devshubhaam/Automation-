@@ -258,7 +258,12 @@ class ProgressRenderer:
         return ["", "🖼 <b>Images:</b>"] + self._limit_lines(entries)
 
     def _render_video_files(self, job: Job) -> list[str]:
-        """Per-video status from ``metadata["video_status"]``."""
+        """Per-video status from ``metadata["video_status"]``.
+
+        One short line per video (the single progress message is edited, no
+        extra messages): ``1/3 video1.mp4 → ⏳ Processing (video bot) · @Bot``.
+        The bot / provider are shown once they are known.
+        """
 
         metadata = getattr(job, "metadata", None) or {}
         statuses = metadata.get("video_status") or []
@@ -266,26 +271,52 @@ class ProgressRenderer:
         if not statuses:
             return []
 
+        total = len(statuses)
         entries: list[str] = []
 
-        for entry in statuses:
+        for index, entry in enumerate(statuses, start=1):
             name = self._escape(entry.get("filename", ""))
             status = entry.get("status")
+            bot = entry.get("bot")
+            provider = entry.get("provider")
 
             if status == "done":
                 text = "✅ URL received"
+
+                if provider:
+                    text += f" · {self._escape(self._provider_label(provider))}"
+
             elif status == "failed":
                 text = f"❌ {self._escape(str(entry.get('error') or 'failed')[:120])}"
+
             elif status == "processing":
                 text = "⏳ Processing (video bot)"
+
+                if bot:
+                    text += f" · @{self._escape(bot)}"
+
             elif status == "cancelled":
                 text = "🛑 Cancelled"
             else:
                 text = "🕓 Waiting"
 
-            entries.append(f"{name} → {text}")
+            entries.append(f"{index}/{total} {name} → {text}")
 
         return ["", "🎬 <b>Videos (video bot):</b>"] + self._limit_lines(entries)
+
+    @staticmethod
+    def _provider_label(provider: Any) -> str:
+        """``diskwala`` -> ``DiskWala`` (unknown providers are title-cased)."""
+
+        labels = {
+            "diskwala": "DiskWala",
+            "flezen": "Flezen",
+            "custom": "Custom",
+        }
+
+        key = str(provider or "").lower()
+
+        return labels.get(key, str(provider).title() if provider else "unknown")
 
     def _limit_lines(self, entries: list[str]) -> list[str]:
         """Keep the message well below Telegram's 4096 character limit."""
@@ -515,6 +546,9 @@ class ProgressRenderer:
 
             label = filename or path or "Media"
 
+            # A video-bot link: show the provider behind it (e.g. DiskWala).
+            provider = self._video_provider_name(result, provider)
+
             final_url = url or display_url
 
             if final_url:
@@ -567,6 +601,8 @@ class ProgressRenderer:
             )
 
             label = filename or path or "Media"
+
+            provider = self._video_provider_name(failure, provider)
 
             lines.append(
                 f"• <b>{self._escape(str(label))}</b> "
@@ -780,6 +816,28 @@ class ProgressRenderer:
                 "ignored_count",
             )
         )
+
+    @staticmethod
+    def _video_provider_name(item: Any, provider: Any) -> Any:
+        """Real provider name for ``video_bot`` items, otherwise unchanged."""
+
+        if str(provider).lower() != "video_bot":
+            return provider
+
+        extra = ProgressRenderer._get_value(item, "extra", None)
+
+        if isinstance(extra, dict):
+            name = extra.get("provider_name")
+
+            if name:
+                return ProgressRenderer._provider_label(name)
+
+            bot = extra.get("bot")
+
+            if bot:
+                return f"@{bot}"
+
+        return provider
 
     @staticmethod
     def _get_value(
