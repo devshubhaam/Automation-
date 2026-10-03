@@ -7,13 +7,14 @@ frozen Settings object, so os.getenv() is never scattered around.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
 from dotenv import load_dotenv
 
-__all__ = ["ConfigError", "Settings", "VALID_LOG_LEVELS"]
+__all__ = ["ConfigError", "Settings", "VALID_LOG_LEVELS", "parse_video_bots"]
 
 DEFAULT_ENV_FILE = ".env"
 
@@ -177,6 +178,44 @@ def _get_path(
     ).expanduser()
 
 
+def _normalise_bot_username(value: str) -> Optional[str]:
+    """``@Bot`` / ``Bot`` / ``t.me/Bot`` / ``https://t.me/Bot`` -> ``Bot``."""
+
+    value = value.strip()
+    value = re.sub(r"^(https?://)?(t\.me/)", "", value, flags=re.IGNORECASE)
+    value = value.lstrip("@").strip("/").strip()
+
+    return value or None
+
+
+def parse_video_bots(value: Optional[str]) -> tuple[str, ...]:
+    """Parse ``VIDEO_BOTS``.
+
+    ``"@FirstBot, SecondBot"`` -> ``("FirstBot", "SecondBot")``.
+
+    Splits on commas, trims whitespace, ignores empty values, accepts names
+    with or without ``@`` and removes duplicates (case-insensitive) while
+    keeping the configured order.
+    """
+
+    if not value:
+        return ()
+
+    bots: list[str] = []
+    seen: set[str] = set()
+
+    for part in value.split(","):
+        name = _normalise_bot_username(part)
+
+        if not name or name.lower() in seen:
+            continue
+
+        seen.add(name.lower())
+        bots.append(name)
+
+    return tuple(bots)
+
+
 # --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
@@ -269,9 +308,18 @@ class Settings:
     telegraph_access_token: Optional[str] = None
     telegraph_author_name: Optional[str] = None
 
-    # Part 3 - video bot. Videos are sent to this Telegram bot with the
-    # userbot session; the bot replies with a link.
+    # Part 3 - video uploader bots. Videos are sent to these Telegram bots
+    # (in order) with the userbot session; the bot replies with a link.
+    # ``video_bots`` holds normalised usernames (no "@"); it comes from
+    # VIDEO_BOTS (preferred) or, for backwards compatibility, VIDEO_BOT_USERNAME.
+    video_bots: tuple[str, ...] = ()
+    # Deprecated single-bot setting (raw VIDEO_BOT_USERNAME value).
     video_bot_username: Optional[str] = None
+    # Try the next bot after a provider TIMEOUT. Off by default because the
+    # first bot may still be processing the video (duplicate upload risk).
+    video_bot_fallback_on_timeout: bool = False
+    # Accept only bot messages that are Telegram replies to the sent video.
+    video_bot_require_reply: bool = True
     # Per-video wait for the bot's link AFTER the file was delivered to it.
     video_bot_timeout_seconds: int = 1800
     # Attempts to *deliver* one video to the bot. A video is never re-sent
@@ -327,6 +375,15 @@ class Settings:
             level,
         )
 
+        # Normalise the video bots and keep the legacy single-bot setting
+        # working: VIDEO_BOTS wins, VIDEO_BOT_USERNAME is the fallback.
+        bots = parse_video_bots(",".join(self.video_bots)) if self.video_bots else ()
+
+        if not bots and self.video_bot_username:
+            bots = parse_video_bots(self.video_bot_username)
+
+        object.__setattr__(self, "video_bots", bots)
+
         if float(self.video_max_size_gb) <= 0:
             raise ConfigError(
                 f"VIDEO_MAX_SIZE_GB must be > 0 (got {self.video_max_size_gb})"
@@ -356,7 +413,7 @@ class Settings:
             f"mongodb_collection={self.mongodb_collection!r}, "
             f"imgbb_api_key='***redacted***', "
             f"telegraph_access_token='***redacted***', "
-            f"video_bot_username={self.video_bot_username!r}, "
+            f"video_bots={list(self.video_bots)!r}, "
             f"video_bot_timeout_seconds={self.video_bot_timeout_seconds}, "
             f"video_max_size_gb={self.video_max_size_gb}"
             f")"
@@ -566,10 +623,24 @@ class Settings:
                 default=None,
             ),
 
-            # Part 3 - video bot (e.g. VIDEO_BOT_USERNAME=@FileUploaderBot)
+            # Part 3 - video bots, e.g.
+            #   VIDEO_BOTS=@FirstUploaderBot,@SecondUploaderBot
+            # VIDEO_BOT_USERNAME is still read as a fallback (deprecated).
+            video_bots=parse_video_bots(
+                _get_str("VIDEO_BOTS", default=None)
+                or _get_str("VIDEO_BOT_USERNAME", default=None)
+            ),
             video_bot_username=_get_str(
                 "VIDEO_BOT_USERNAME",
                 default=None,
+            ),
+            video_bot_fallback_on_timeout=_get_bool(
+                "VIDEO_BOT_FALLBACK_ON_TIMEOUT",
+                default=False,
+            ),
+            video_bot_require_reply=_get_bool(
+                "VIDEO_BOT_REQUIRE_REPLY",
+                default=True,
             ),
             video_bot_timeout_seconds=_get_int(
                 "VIDEO_BOT_TIMEOUT_SECONDS",
