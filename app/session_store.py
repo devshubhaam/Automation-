@@ -72,6 +72,15 @@ class MongoSessionStore:
             upsert=True,
         )
 
+    def delete(
+        self,
+        session_name: str,
+    ) -> None:
+        """Delete a saved StringSession (e.g. after it was revoked)."""
+        self._collection.delete_one(
+            {"_id": session_name}
+        )
+
     def close(self) -> None:
         """Close the MongoDB client."""
         self._client.close()
