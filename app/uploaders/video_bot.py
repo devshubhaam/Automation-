@@ -30,8 +30,23 @@ Mapping video -> link (the critical part)
   ``require_reply=False`` (``VIDEO_BOT_REQUIRE_REPLY=false``) additionally
   accepts newer NON-reply messages; only use that for bots that never reply.
 
-Fallback policy (no duplicate uploads)
-======================================
+Modes (``VIDEO_BOT_MODE``)
+==========================
+``all`` (default)
+    EVERY video is uploaded to EVERY configured bot, one bot after the other
+    (never in parallel). Each bot gives its own link (DiskWala link AND Flezen
+    link). A bot that fails (delivery, rejection, timeout) does NOT stop the
+    other bots: its failure is reported and the links of the other bots are
+    kept. A video only fails completely when every bot failed. Bots are
+    different providers, so a timeout at one bot never creates a duplicate
+    upload at another.
+
+``fallback``
+    The first bot that returns a link wins; the next bot is only used
+    according to the policy below.
+
+Fallback policy (``fallback`` mode, no duplicate uploads)
+=========================================================
 For each video the bots are tried in the configured order:
 
 1. Delivery failure (Telegram could not send the file; all
@@ -503,6 +518,8 @@ class MultiVideoBotUploader:
 
     #: The pipeline passes ``on_attempt`` only to uploaders with this flag.
     supports_progress_callback = True
+    #: The pipeline passes ``on_link`` (called for every received link).
+    supports_link_callback = True
 
     def __init__(
         self,
@@ -517,7 +534,12 @@ class MultiVideoBotUploader:
         retry_delay_seconds: float = 5.0,
         fallback_on_timeout: bool = False,
         require_reply: bool = True,
+        mode: str = "all",
     ) -> None:
+        mode = str(mode or "all").strip().lower()
+        if mode not in ("all", "fallback"):
+            raise UploadError(f"Invalid video bot mode: {mode!r} (use 'all' or 'fallback')")
+        self.mode = mode
         names: list[str] = []
         for bot in bots or ():
             name = normalise_username(bot)
@@ -578,13 +600,19 @@ class MultiVideoBotUploader:
         client: Any = None,
         should_cancel: Callable[[], bool] | None = None,
         on_attempt: Callable[[str, int, int], Any] | None = None,
+        on_link: Callable[[dict[str, str]], Any] | None = None,
     ) -> dict[str, Any]:
-        """Send ``path`` to the first bot that handles it; return its link.
+        """Send ``path`` to the bots and return the link(s).
 
         Result: ``{"provider": "video_bot", "provider_name": "diskwala",
-        "bot": "FirstUploaderBot", "url": ..., "attempts": [...]}``.
+        "bot": "FirstUploaderBot", "url": ..., "attempts": [...],
+        "links": [{"bot", "provider_name", "url"}, ...],
+        "failures": [{"bot", "kind", "reason"}, ...]}``.
+        ``url`` / ``bot`` / ``provider_name`` describe the FIRST link. In
+        ``all`` mode ``links`` has one entry per successful bot.
         ``on_attempt(bot, index, total)`` is called (sync or async) right
-        before a bot is tried, so progress can show the active bot.
+        before a bot is tried, ``on_link(link)`` right after a bot returned
+        its link (so it is kept even if a later bot or a cancel interrupts).
         """
         path = Path(path)
         if not self.uploaders:
@@ -604,7 +632,98 @@ class MultiVideoBotUploader:
             raise UploadError("Telegram client is unavailable for the video bot")
 
         async with self._lock:
-            return await self._try_bots(path, client, should_cancel, on_attempt)
+            if self.mode == "all":
+                return await self._try_all(path, client, should_cancel, on_attempt, on_link)
+            return await self._try_bots(path, client, should_cancel, on_attempt, on_link)
+
+    @staticmethod
+    async def _call(callback: Callable[..., Any] | None, *args: Any) -> None:
+        """Run a sync/async progress callback; its errors never matter."""
+        if callback is None:
+            return
+        try:
+            outcome = callback(*args)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:
+            logger.debug("progress callback failed", exc_info=True)
+
+    def _make_link(self, bot: str, url: str) -> dict[str, str]:
+        provider = provider_for_url(url, self.extra_url_pattern)
+        if provider:
+            self._bot_providers[bot] = provider
+        return {"bot": bot, "provider_name": provider or "unknown", "url": url}
+
+    async def _try_all(
+        self,
+        path: Path,
+        client: Any,
+        should_cancel: Callable[[], bool] | None,
+        on_attempt: Callable[[str, int, int], Any] | None,
+        on_link: Callable[[dict[str, str]], Any] | None,
+    ) -> dict[str, Any]:
+        """Upload ``path`` to EVERY bot, sequentially; keep every link."""
+        attempts: list[dict[str, str]] = []
+        links: list[dict[str, str]] = []
+        failures: list[dict[str, str]] = []
+        last_exc: UploadError | None = None
+        total = len(self.uploaders)
+
+        for index, uploader in enumerate(self.uploaders, start=1):
+            bot = uploader.bot_username or ""
+
+            if should_cancel and should_cancel():
+                raise UploadCancelled()
+
+            await self._call(on_attempt, bot, index, total)
+
+            try:
+                result = await uploader.upload(
+                    path, client=client, should_cancel=should_cancel
+                )
+            except (UploadCancelled, VideoTooLargeError):
+                raise
+            except VideoDeliveryError as exc:
+                kind, last_exc = "delivery", exc
+            except VideoBotRejectedError as exc:
+                kind, last_exc = "rejected", exc
+            except VideoTimeoutError as exc:
+                kind, last_exc = "timeout", exc
+            except UploadError:
+                raise  # not bot specific (client unavailable, ...)
+            else:
+                link = self._make_link(bot, str(result.get("url", "")))
+                links.append(link)
+                attempts.append({"bot": bot, "kind": "ok", "reason": ""})
+                await self._call(on_link, dict(link))
+                continue
+
+            attempts.append({"bot": bot, "kind": kind, "reason": str(last_exc)})
+            failures.append({"bot": bot, "kind": kind, "reason": str(last_exc)})
+            logger.warning(
+                "Video %s: bot @%s failed (%s); continuing with the remaining bots",
+                path.name, bot, kind,
+            )
+
+        if not links:
+            assert last_exc is not None
+            if len(attempts) == 1:
+                last_exc.bot = attempts[0]["bot"]  # type: ignore[attr-defined]
+                last_exc.attempts = attempts  # type: ignore[attr-defined]
+                raise last_exc
+            message = "; ".join(f"@{a['bot']}: {a['reason']}" for a in attempts)
+            raise VideoUploadFailed(message, attempts) from last_exc
+
+        first = links[0]
+        return {
+            "provider": "video_bot",
+            "provider_name": first["provider_name"],
+            "bot": first["bot"],
+            "url": first["url"],
+            "attempts": attempts,
+            "links": links,
+            "failures": failures,
+        }
 
     async def _try_bots(
         self,
@@ -612,6 +731,7 @@ class MultiVideoBotUploader:
         client: Any,
         should_cancel: Callable[[], bool] | None,
         on_attempt: Callable[[str, int, int], Any] | None,
+        on_link: Callable[[dict[str, str]], Any] | None = None,
     ) -> dict[str, Any]:
         attempts: list[dict[str, str]] = []
         last_exc: UploadError | None = None
@@ -651,17 +771,21 @@ class MultiVideoBotUploader:
                 raise  # not bot specific (client unavailable, ...)
 
             else:
-                url = str(result.get("url", ""))
-                provider = provider_for_url(url, self.extra_url_pattern)
-                if provider:
-                    self._bot_providers[bot] = provider
+                link = self._make_link(bot, str(result.get("url", "")))
                 attempts.append({"bot": bot, "kind": "ok", "reason": ""})
+                await self._call(on_link, dict(link))
                 return {
                     "provider": "video_bot",
-                    "provider_name": provider or "unknown",
+                    "provider_name": link["provider_name"],
                     "bot": bot,
-                    "url": url,
+                    "url": link["url"],
                     "attempts": attempts,
+                    "links": [link],
+                    "failures": [
+                        {"bot": a["bot"], "kind": a["kind"], "reason": a["reason"]}
+                        for a in attempts
+                        if a["kind"] != "ok"
+                    ],
                 }
 
             attempts.append({"bot": bot, "kind": kind, "reason": str(last_exc)})
