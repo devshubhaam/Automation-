@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from telethon import TelegramClient, events
+from telethon.errors import AuthKeyDuplicatedError
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 
@@ -31,6 +32,7 @@ class TelegramUserbot:
     - Submit jobs to PipelineWorker.
     - Provide /ping, /start, /status and /cancel.
     - Persist StringSession to MongoDB.
+    - Recover automatically from a revoked (AuthKeyDuplicated) session.
     """
 
     def __init__(
@@ -89,6 +91,8 @@ class TelegramUserbot:
                 )
 
             else:
+                session_source = StringSession()
+
                 logger.info(
                     "No Telegram session found in MongoDB; "
                     "QR login will create the first session"
@@ -104,19 +108,33 @@ class TelegramUserbot:
         # Telethon client
         # --------------------------------------------------------------
 
-        self.client = TelegramClient(
-            session_source,
-            settings.api_id,
-            settings.api_hash,
-            device_model="Media Processor",
-            system_version="PART-2",
-            app_version="0.2.0",
+        self.client = self._build_client(
+            session_source
         )
 
         self.owner_id: Optional[int] = None
         self.owner_username: Optional[str] = None
 
         self._handlers_registered = False
+
+    # ==================================================================
+    # CLIENT FACTORY
+    # ==================================================================
+
+    def _build_client(
+        self,
+        session_source,
+    ) -> TelegramClient:
+        """Create a Telethon client for the given session source."""
+
+        return TelegramClient(
+            session_source,
+            self.settings.api_id,
+            self.settings.api_hash,
+            device_model="Media Processor",
+            system_version="PART-2",
+            app_version="0.2.0",
+        )
 
     # ==================================================================
     # START / STOP
@@ -126,11 +144,38 @@ class TelegramUserbot:
         """Connect to Telegram.
 
         Interactive first-time login is handled by LoginBot.
+
+        If Telegram revoked the saved session because it was used from
+        two IP addresses at once (AuthKeyDuplicatedError), the dead
+        session is discarded and a fresh unauthorized client is created
+        so the LoginBot can perform a new QR login instead of the whole
+        application crash-looping.
         """
 
         logger.info(
             "Telegram client starting"
         )
+
+        try:
+            await self._connect_and_check()
+
+        except AuthKeyDuplicatedError:
+            logger.error(
+                "Telegram session was revoked "
+                "(AuthKeyDuplicatedError: used from two IPs at once). "
+                "Discarding it; use /login on the login bot "
+                "to authorize again. Make sure only ONE instance "
+                "of this app uses the session."
+            )
+
+            await self._reset_dead_session()
+
+            # A brand-new session cannot be duplicated, so any error
+            # from here on is a real failure.
+            await self._connect_and_check()
+
+    async def _connect_and_check(self) -> None:
+        """Connect and, if already authorized, finish setup."""
 
         await self.client.connect()
 
@@ -150,6 +195,70 @@ class TelegramUserbot:
             )
 
         self.finish_authenticated_account(me)
+
+    async def _reset_dead_session(self) -> None:
+        """Delete the revoked session and build a fresh client."""
+
+        try:
+            await self.client.disconnect()
+
+        except Exception:
+            logger.debug(
+                "Ignoring error while disconnecting dead client",
+                exc_info=True,
+            )
+
+        if self.session_store is not None:
+            try:
+                await asyncio.to_thread(
+                    self.session_store.delete,
+                    self.settings.session_name,
+                )
+
+                logger.info(
+                    "Deleted revoked Telegram session from MongoDB"
+                )
+
+            except Exception:
+                logger.exception(
+                    "Failed to delete revoked session from MongoDB"
+                )
+
+            fresh_source = StringSession()
+
+        else:
+            base = str(self.settings.session_path)
+
+            candidates = {
+                Path(base),
+                Path(base + ".session"),
+            }
+
+            for path in candidates:
+                try:
+                    if path.is_file():
+                        path.unlink()
+
+                        logger.info(
+                            "Deleted revoked local session file %s",
+                            path,
+                        )
+
+                except Exception:
+                    logger.exception(
+                        "Failed to delete local session file %s",
+                        path,
+                    )
+
+            fresh_source = base
+
+        self.owner_id = None
+        self.owner_username = None
+        self._handlers_registered = False
+
+        self.client = self._build_client(
+            fresh_source
+        )
 
     def finish_authenticated_account(
         self,
