@@ -32,7 +32,7 @@ from .uploaders import (
     TelegraphPublisher,
     UploadCancelled,
     UploadError,
-    VideoBotUploader,
+    MultiVideoBotUploader,
     VideoTooLargeError,
     video_too_large_message,
 )
@@ -131,21 +131,24 @@ class PipelineWorker:
             author_name=settings.telegraph_author_name,
         )
 
-        # Part 3: videos go ONLY to the video bot (a Telegram bot) and come back
-        # as links stored in the job results/metadata (never in Telegraph).
-        # Set by Application so the bot can use the userbot client.
+        # Part 3: videos go ONLY to the configured video uploader bots
+        # (VIDEO_BOTS, tried in order) and come back as links stored in the job
+        # results/metadata (never in Telegraph, never in ImgBB).
+        # Set by Application so the bots can use the userbot client.
         self.telegram_client_provider: Any = None
-        self.video_uploader = video_uploader or VideoBotUploader(
-            settings.video_bot_username,
+        self.video_uploader = video_uploader or MultiVideoBotUploader(
+            settings.video_bots,
             client_provider=lambda: (
                 self.telegram_client_provider()
                 if self.telegram_client_provider
                 else None
             ),
             timeout_seconds=settings.video_bot_timeout_seconds,
-            url_pattern=settings.video_url_pattern,
+            extra_url_pattern=settings.video_url_pattern,
             max_size_bytes=settings.video_max_size_bytes,
             send_attempts=settings.video_bot_send_attempts,
+            fallback_on_timeout=settings.video_bot_fallback_on_timeout,
+            require_reply=settings.video_bot_require_reply,
         )
 
     # ------------------------------------------------------------------
@@ -546,16 +549,32 @@ class PipelineWorker:
         results/metadata and never reach ImgBB or Telegraph.
         """
 
-        image_urls = await self._upload_images(job, images)
+        # Image problems (ImgBB / Telegraph) must NEVER stop the videos.
+        try:
+            image_urls = await self._upload_images(job, images)
 
-        if image_urls:
-            self._checkpoint(job)  # before Telegraph article
-            await self._publish_article(job, image_urls)
-            await self._notify(job)
-        else:
-            logger.info(
-                "Job %s: no uploaded images, Telegraph article not created",
+            if image_urls:
+                self._checkpoint(job)  # before Telegraph article
+                await self._publish_article(job, image_urls)
+                await self._notify(job)
+            else:
+                logger.info(
+                    "Job %s: no uploaded images, Telegraph article not created",
+                    job.job_id,
+                )
+
+        except (JobCancelled, asyncio.CancelledError):
+            raise
+
+        except Exception as exc:
+            logger.exception(
+                "Job %s: image/article stage failed; continuing with videos",
                 job.job_id,
+            )
+            self._record_article_failure(
+                job,
+                Path(job.archive_name).stem or "Media",
+                f"{type(exc).__name__}: {exc}",
             )
 
         await self._upload_videos(job, videos)
@@ -643,13 +662,16 @@ class PipelineWorker:
         job: Job,
         videos: list[Any],
     ) -> list[dict[str, Any]]:
-        """Send each video to the video bot, one at a time, independently.
+        """Send each video to the video bots, one at a time, independently.
 
         Every video keeps its own status/result entry keyed by its filename
         (and relative path), so one failure or timeout never affects another
         video's mapping. Results are stored in ``job.upload_results`` and in
         ``metadata["video_results"]`` / ``["video_failures"]`` /
         ``["video_status"]``. Returns the successful ``video_results`` entries.
+
+        Which bot handled a video (and the provider behind its link) is stored
+        per video as ``bot`` / ``provider``.
         """
 
         if not videos:
@@ -663,6 +685,8 @@ class PipelineWorker:
                 "status": "pending",
                 "url": None,
                 "error": None,
+                "bot": None,
+                "provider": None,
             }
             for m in videos
         ]
@@ -703,21 +727,42 @@ class PipelineWorker:
             publish_metadata()
             await self._notify(job)
 
+            async def on_attempt(
+                bot: str,
+                index: int,
+                total: int,
+                entry: dict[str, Any] = entry,
+            ) -> None:
+                """Show which bot is being tried (edits the progress message)."""
+                entry["status"] = "processing"
+                entry["bot"] = bot
+                publish_metadata()
+                await self._notify(job)
+
             try:
                 size = self._video_size(video_path)
                 if size > limit:
+                    # Never sent to any uploader bot.
                     raise VideoTooLargeError(video_too_large_message(size, limit))
 
-                logger.info("Job %s: sending video to video bot: %s", job.job_id, filename)
+                logger.info("Job %s: sending video to video bot(s): %s", job.job_id, filename)
 
-                response = await self.video_uploader.upload(
-                    video_path,
-                    client=client,
-                    should_cancel=lambda: job.cancel_requested,
-                )
+                upload_kwargs: dict[str, Any] = {
+                    "client": client,
+                    "should_cancel": lambda: job.cancel_requested,
+                }
+                if getattr(self.video_uploader, "supports_progress_callback", False):
+                    upload_kwargs["on_attempt"] = on_attempt
+
+                response = await self.video_uploader.upload(video_path, **upload_kwargs)
                 url = str(response.get("url", ""))
                 if not url:
                     raise UploadError("Video bot returned no link")
+
+                bot = response.get("bot")
+                provider = response.get("provider_name")
+                extra["bot"] = bot
+                extra["provider_name"] = provider
 
                 if any(r["url"] == url for r in results):
                     logger.warning(
@@ -737,12 +782,16 @@ class PipelineWorker:
                         extra=extra,
                     ),
                 )
-                entry.update(status="done", url=url, error=None)
+                entry.update(status="done", url=url, error=None, bot=bot, provider=provider)
                 results.append(
                     {
                         "filename": filename,
+                        "file": filename,
                         "relative_path": entry["relative_path"],
+                        "provider": provider,
+                        "bot": bot,
                         "url": url,
+                        "status": "completed",
                     }
                 )
 
@@ -753,11 +802,11 @@ class PipelineWorker:
 
             except UploadError as exc:
                 logger.warning("Job %s: video bot failed for %s: %s", job.job_id, filename, exc)
-                self._fail_video(job, entry, failures, str(exc), extra)
+                self._fail_video(job, entry, failures, str(exc), extra, exc)
 
             except Exception as exc:
                 logger.exception("Job %s: unexpected video bot error for %s", job.job_id, filename)
-                self._fail_video(job, entry, failures, f"{type(exc).__name__}: {exc}", extra)
+                self._fail_video(job, entry, failures, f"{type(exc).__name__}: {exc}", extra, exc)
 
             publish_metadata()
             await self._notify(job)
@@ -787,16 +836,33 @@ class PipelineWorker:
         failures: list[dict[str, Any]],
         error: str,
         extra: dict[str, Any],
+        exc: BaseException | None = None,
     ) -> None:
         """Record one failed video (status entry, failure list, job failure)."""
-        entry.update(status="failed", url=None, error=error)
+        # The last bot that was tried (set by the multi-bot uploader) and the
+        # provider that bot is known to use (learned from earlier links).
+        bot = getattr(exc, "bot", None) or entry.get("bot")
+        provider = None
+        provider_lookup = getattr(self.video_uploader, "provider_for_bot", None)
+        if callable(provider_lookup) and bot:
+            provider = provider_lookup(bot)
+
+        entry.update(status="failed", url=None, error=error, bot=bot, provider=provider)
         failures.append(
             {
                 "filename": entry["filename"],
+                "file": entry["filename"],
                 "relative_path": entry["relative_path"],
+                "provider": provider,
+                "bot": bot,
                 "error": error,
+                "reason": error,
+                "status": "failed",
             }
         )
+        extra = dict(extra)
+        extra["bot"] = bot
+        extra["provider_name"] = provider
         self.job_manager.add_upload_failure(
             job.job_id,
             UploadFailure(
