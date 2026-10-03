@@ -13,7 +13,7 @@ from .archive_processor import (
     safe_extract,
     validate_archive,
 )
-from .config import ConfigError, Settings
+from .config import ConfigError, Settings, resolve_article_title
 from .job_manager import (
     Job,
     JobManager,
@@ -1005,7 +1005,10 @@ class PipelineWorker:
     ) -> None:
         """Create the Telegraph article(s) from the ImgBB image URLs only."""
 
-        title = Path(job.archive_name).stem or "Media"
+        # Fixed title from TELEGRAPH_TITLE; falls back to the archive name.
+        title = resolve_article_title(
+            getattr(self.settings, "telegraph_title", None), job.archive_name
+        )
 
         try:
             logger.info(
