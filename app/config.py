@@ -315,7 +315,11 @@ class Settings:
     video_bots: tuple[str, ...] = ()
     # Deprecated single-bot setting (raw VIDEO_BOT_USERNAME value).
     video_bot_username: Optional[str] = None
-    # Try the next bot after a provider TIMEOUT. Off by default because the
+    # "all": EVERY video is uploaded to EVERY configured bot (one link per
+    # bot, e.g. a DiskWala link AND a Flezen link). "fallback": the bots are
+    # tried in order and the first link wins.
+    video_bot_mode: str = "all"
+    # (fallback mode only) Try the next bot after a provider TIMEOUT. Off by default because the
     # first bot may still be processing the video (duplicate upload risk).
     video_bot_fallback_on_timeout: bool = False
     # Accept only bot messages that are Telegram replies to the sent video.
@@ -384,6 +388,13 @@ class Settings:
 
         object.__setattr__(self, "video_bots", bots)
 
+        mode = str(self.video_bot_mode or "all").strip().lower()
+        if mode not in ("all", "fallback"):
+            raise ConfigError(
+                f"VIDEO_BOT_MODE must be 'all' or 'fallback' (got {self.video_bot_mode!r})"
+            )
+        object.__setattr__(self, "video_bot_mode", mode)
+
         if float(self.video_max_size_gb) <= 0:
             raise ConfigError(
                 f"VIDEO_MAX_SIZE_GB must be > 0 (got {self.video_max_size_gb})"
@@ -414,6 +425,7 @@ class Settings:
             f"imgbb_api_key='***redacted***', "
             f"telegraph_access_token='***redacted***', "
             f"video_bots={list(self.video_bots)!r}, "
+            f"video_bot_mode={self.video_bot_mode!r}, "
             f"video_bot_timeout_seconds={self.video_bot_timeout_seconds}, "
             f"video_max_size_gb={self.video_max_size_gb}"
             f")"
@@ -634,6 +646,9 @@ class Settings:
                 "VIDEO_BOT_USERNAME",
                 default=None,
             ),
+            video_bot_mode=(
+                _get_str("VIDEO_BOT_MODE", default="all") or "all"
+            ).strip().lower(),
             video_bot_fallback_on_timeout=_get_bool(
                 "VIDEO_BOT_FALLBACK_ON_TIMEOUT",
                 default=False,
