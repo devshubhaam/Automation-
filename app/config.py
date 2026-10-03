@@ -46,6 +46,15 @@ def _raw(name: str) -> Optional[str]:
     return value or None
 
 
+def resolve_article_title(configured: Optional[str], archive_name: str) -> str:
+    """Title sent to Telegraph: the fixed TELEGRAPH_TITLE, else the archive stem."""
+
+    fixed = (configured or "").strip()
+    if fixed:
+        return fixed
+    return Path(archive_name or "").stem or "Media"
+
+
 def _get_str(
     name: str,
     *,
@@ -307,6 +316,9 @@ class Settings:
     # Optional: if unset, an anonymous account is created on first use.
     telegraph_access_token: Optional[str] = None
     telegraph_author_name: Optional[str] = None
+    # Fixed Telegraph article title (TELEGRAPH_TITLE). Empty/None keeps the
+    # old behaviour (archive file name without extension).
+    telegraph_title: Optional[str] = None
 
     # Part 3 - video uploader bots. Videos are sent to these Telegram bots
     # (in order) with the userbot session; the bot replies with a link.
@@ -632,6 +644,10 @@ class Settings:
             # Part 2 - Telegraph article (embeds ImgBB image links only)
             telegraph_access_token=_get_str(
                 "TELEGRAPH_ACCESS_TOKEN",
+                default=None,
+            ),
+            telegraph_title=_get_str(
+                "TELEGRAPH_TITLE",
                 default=None,
             ),
             telegraph_author_name=_get_str(
