@@ -475,7 +475,7 @@ class LoginBot:
                 await client.connect()
 
             # ---------------------------------------------------------- #
-            # Existing authorized session?
+            # Existing authorized session
             # ---------------------------------------------------------- #
 
             if await client.is_user_authorized():
@@ -486,12 +486,16 @@ class LoginBot:
                 )
 
                 # IMPORTANT:
-                # The main application is already using this exact
-                # authorized Telegram client/session. Do NOT call
-                # _finish_login() here because it performs get_me()
-                # again through the login command and can trigger
-                # AuthKeyDuplicatedError when the same authorization
-                # key is active elsewhere.
+                # The main application is already using this
+                # authorized Telegram session.
+                #
+                # Do NOT call _finish_login() here.
+                #
+                # Calling _finish_login() again performs get_me()
+                # on the already-active authorization key and can
+                # cause AuthKeyDuplicatedError when the same
+                # authorization key is active from another process
+                # or instance.
                 await event.reply(
                     "✅ Userbot is already authorized.\n\n"
                     "QR login is not required.\n"
@@ -543,12 +547,9 @@ class LoginBot:
             while True:
 
                 # ------------------------------------------------------ #
-                # CRITICAL FIX:
+                # CRITICAL:
                 #
                 # Start waiting BEFORE sending the QR.
-                #
-                # Telethon documentation explicitly requires wait()
-                # to be running while the QR is being scanned.
                 # ------------------------------------------------------ #
 
                 wait_task = asyncio.create_task(
@@ -557,8 +558,7 @@ class LoginBot:
 
                 try:
                     # -------------------------------------------------- #
-                    # Now send the QR.
-                    # wait_task is already listening.
+                    # Send QR after wait() is already listening.
                     # -------------------------------------------------- #
 
                     await self._send_qr(
@@ -611,7 +611,7 @@ class LoginBot:
                     )
 
                     # -------------------------------------------------- #
-                    # Make sure old wait task is gone.
+                    # Cancel old wait task.
                     # -------------------------------------------------- #
 
                     if not wait_task.done():
@@ -624,8 +624,7 @@ class LoginBot:
                             pass
 
                     # -------------------------------------------------- #
-                    # Telethon's documented way to refresh
-                    # an expired QR token.
+                    # Recreate expired QR token.
                     # -------------------------------------------------- #
 
                     await qr_login.recreate()
@@ -638,11 +637,6 @@ class LoginBot:
                     continue
 
                 except SessionPasswordNeededError:
-
-                    # -------------------------------------------------- #
-                    # This can also surface directly from the wait task
-                    # depending on the Telethon version.
-                    # -------------------------------------------------- #
 
                     logger.info(
                         "QR accepted; Telegram "
@@ -687,7 +681,7 @@ class LoginBot:
 
                 finally:
                     # -------------------------------------------------- #
-                    # If wait_task is somehow still alive, clean it up.
+                    # Always clean up wait task.
                     # -------------------------------------------------- #
 
                     if not wait_task.done():
