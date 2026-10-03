@@ -352,6 +352,9 @@ class ProgressRenderer:
                 if links:
                     text += f" · {len(links)} link(s) ready"
 
+            elif status == "merging":
+                text = "🔀 Merging videos (no re-encoding)"
+
             elif status == "cancelled":
                 text = "🛑 Cancelled"
             else:
