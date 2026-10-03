@@ -116,12 +116,7 @@ class ProgressRenderer:
             )
 
         elif job.status == JobStatus.CANCELLED:
-            lines.extend(
-                [
-                    "",
-                    "🚫 Job cancelled.",
-                ]
-            )
+            lines.extend(self._render_cancelled(job))
 
         if self._has_media_stats(job):
             lines.extend(self._render_media_summary(job))
@@ -329,142 +324,212 @@ class ProgressRenderer:
         return shown
 
     # ------------------------------------------------------------------
-    # COMPLETED
+    # FINAL MESSAGE (COMPLETED / COMPLETED_WITH_ERRORS / CANCELLED)
     # ------------------------------------------------------------------
+
+    #: Telegram rejects messages above 4096 characters; stay well below it so
+    #: the final edit can never fail because of its length.
+    MAX_MESSAGE_CHARS = 3800
+    MAX_REASON_CHARS = 140
+    MAX_NAME_CHARS = 90
+
+    #: Items shown per section, reduced step by step until the message fits.
+    _CAP_STEPS = (
+        {"video": 40, "failed": 20, "skipped": 15, "imgbb": 10},
+        {"video": 30, "failed": 15, "skipped": 10, "imgbb": 0},
+        {"video": 20, "failed": 10, "skipped": 6, "imgbb": 0},
+        {"video": 12, "failed": 6, "skipped": 3, "imgbb": 0},
+        {"video": 6, "failed": 4, "skipped": 2, "imgbb": 0},
+        {"video": 3, "failed": 2, "skipped": 1, "imgbb": 0},
+        {"video": 0, "failed": 0, "skipped": 0, "imgbb": 0},
+    )
 
     def _render_completed(self, job: Job) -> list[str]:
-        lines: list[str] = [
-            "",
-            "🎉 <b>Processing completed successfully.</b>",
-        ]
-
-        results = list(
-            getattr(job, "upload_results", []) or []
+        return self._render_final(
+            job, "🎉 <b>Processing completed successfully.</b>"
         )
 
-        articles, image_results, video_results = self._split_results(results)
-
-        if articles:
-            lines.extend(
-                [
-                    "",
-                    "📝 <b>Telegraph article (images):</b>",
-                ]
-            )
-
-            lines.extend(
-                self._render_upload_results(articles)
-            )
-
-        if image_results:
-            lines.extend(
-                [
-                    "",
-                    "🔗 <b>ImgBB image links:</b>",
-                ]
-            )
-
-            lines.extend(
-                self._render_upload_results(image_results)
-            )
-
-        if video_results:
-            lines.extend(
-                [
-                    "",
-                    "🎬 <b>Video links:</b>",
-                ]
-            )
-
-            lines.extend(
-                self._render_upload_results(video_results)
-            )
-
-        skipped_images = self._skipped_large_count(job)
-
-        if skipped_images:
-            lines.extend(
-                [
-                    "",
-                    f"⏭️ <b>Skipped (over 2 MiB):</b> {skipped_images}",
-                ]
-            )
-
-        video_count = self._int_value(
-            job,
-            "video_count",
+    def _render_completed_with_errors(self, job: Job) -> list[str]:
+        return self._render_final(
+            job, "⚠️ <b>Processing completed with some errors.</b>"
         )
 
-        if video_count:
-            lines.extend(
-                [
-                    "",
-                    f"🎬 <b>Videos:</b> {video_count}",
-                ]
-            )
+    def _render_cancelled(self, job: Job) -> list[str]:
+        return self._render_final(job, "🚫 <b>Job cancelled.</b>")
 
-        return lines
+    def _render_final(self, job: Job, headline: str) -> list[str]:
+        """The one final message of a job.
 
-    # ------------------------------------------------------------------
-    # COMPLETED WITH ERRORS
-    # ------------------------------------------------------------------
+        Contains the Telegraph article URL, every successful video URL with
+        its filename, every failed/skipped file with its reason and the overall
+        status. It is cut down step by step so that it always fits into one
+        Telegram message (the ImgBB link list is the first thing to go; the
+        Telegraph article and the video links are the last).
+        """
 
-    def _render_completed_with_errors(
+        last: list[str] = []
+        for caps in self._CAP_STEPS:
+            last = self._build_final(job, headline, caps)
+            if self._length(job, last) <= self.MAX_MESSAGE_CHARS:
+                return last
+        return last
+
+    def _length(self, job: Job, lines: list[str]) -> int:
+        """Approximate size of the whole message (header + body + summary)."""
+
+        header = 260 + len(str(job.archive_name))
+        summary = 120 if self._has_media_stats(job) else 0
+        return header + summary + len("\n".join(lines))
+
+    def _short(self, value: Any, limit: int) -> str:
+        text = " ".join(str(value).split())
+        if len(text) > limit:
+            text = text[: limit - 1] + "…"
+        return self._escape(text)
+
+    def _more(self, hidden: int) -> list[str]:
+        return [f"… and {hidden} more"] if hidden > 0 else []
+
+    def _build_final(
         self,
         job: Job,
+        headline: str,
+        caps: dict[str, int],
     ) -> list[str]:
-        lines: list[str] = [
-            "",
-            "⚠️ <b>Processing completed with some errors.</b>",
-        ]
-
-        results = list(
-            getattr(job, "upload_results", []) or []
-        )
-
-        failures = list(
-            getattr(job, "upload_failures", []) or []
-        )
+        results = list(getattr(job, "upload_results", []) or [])
+        failures = list(getattr(job, "upload_failures", []) or [])
+        metadata = getattr(job, "metadata", None) or {}
+        skipped = list(metadata.get("part2_skipped_large_images") or [])
 
         articles, image_results, video_results = self._split_results(results)
 
+        video_failures = [f for f in failures if self._provider_of(f) == "video_bot"]
+        image_failures = [f for f in failures if self._provider_of(f) == "imgbb"]
+        article_failures = [
+            f for f in failures if self._provider_of(f) == "telegraph_article"
+        ]
+
+        lines: list[str] = ["", headline]
+
+        # ---- overall status ------------------------------------------------
+        lines.append("")
+        lines.append("📊 <b>Overall:</b>")
+        image_count = self._int_value(job, "image_count")
+        video_count = self._int_value(job, "video_count")
+
+        if image_count or image_results or image_failures or skipped:
+            lines.append(
+                f"🖼️ Images: {len(image_results)} uploaded"
+                f" · {len(skipped)} skipped · {len(image_failures)} failed"
+            )
+        if video_count or video_results or video_failures:
+            total = video_count or (len(video_results) + len(video_failures))
+            lines.append(
+                f"🎬 Videos: {len(video_results)}/{total} links received"
+                f" · {len(video_failures)} failed"
+            )
         if articles:
+            lines.append("📝 Telegraph article: created")
+        elif article_failures:
+            lines.append("📝 Telegraph article: failed")
+        elif image_results:
+            lines.append("📝 Telegraph article: not created")
+
+        # ---- Telegraph article ----------------------------------------------
+        if articles:
+            lines.extend(["", "📝 <b>Telegraph article (images):</b>"])
+            for article in articles:
+                url = self._get_value(article, "url", "")
+                if url:
+                    lines.append(self._escape(str(url)))
+
+        # ---- successful videos: filename -> URL ------------------------------
+        if video_results:
+            lines.extend(["", "🎬 <b>Video links:</b>"])
+            shown = video_results[: caps["video"]]
+            for result in shown:
+                name = self._short(
+                    self._get_value(result, "filename", "") or "video",
+                    self.MAX_NAME_CHARS,
+                )
+                provider = self._provider_label_of(result)
+                url = self._escape(str(self._get_value(result, "url", "")))
+                lines.append(f"• <b>{name}</b> ({self._escape(provider)})\n  {url}")
+            lines.extend(self._more(len(video_results) - len(shown)))
+
+        # ---- failures / skips with reasons -----------------------------------
+        failed_entries: list[str] = []
+        for failure in video_failures:
+            failed_entries.append(self._failure_line(failure, "🎬"))
+        for failure in article_failures:
+            failed_entries.append(self._failure_line(failure, "📝"))
+        for failure in image_failures:
+            failed_entries.append(self._failure_line(failure, "🖼️"))
+
+        if failed_entries:
+            lines.extend(["", "❌ <b>Failed:</b>"])
+            shown_failed = failed_entries[: caps["failed"]]
+            lines.extend(shown_failed)
+            lines.extend(self._more(len(failed_entries) - len(shown_failed)))
+
+        if skipped:
+            lines.extend(["", "⏭️ <b>Skipped:</b>"])
+            shown_skipped = skipped[: caps["skipped"]]
+            for item in shown_skipped:
+                lines.append(self._skipped_line(item))
+            lines.extend(self._more(len(skipped) - len(shown_skipped)))
+
+        # ---- ImgBB links (lowest priority; dropped first when too long) ------
+        if image_results and caps["imgbb"]:
+            lines.extend(["", "🔗 <b>ImgBB image links:</b>"])
+            shown_images = image_results[: caps["imgbb"]]
+            lines.extend(self._render_upload_results(shown_images))
+            lines.extend(self._more(len(image_results) - len(shown_images)))
+        elif image_results:
             lines.extend(
                 [
                     "",
-                    "📝 <b>Telegraph article (images):</b>",
+                    f"🔗 {len(image_results)} ImgBB image link(s) are embedded "
+                    "in the Telegraph article.",
                 ]
-            )
-
-            lines.extend(
-                self._render_upload_results(articles)
-            )
-
-        if image_results or video_results:
-            lines.extend(
-                [
-                    "",
-                    "🔗 <b>Successful uploads:</b>",
-                ]
-            )
-
-            lines.extend(
-                self._render_upload_results(image_results + video_results)
-            )
-
-        if failures:
-            lines.extend(
-                [
-                    "",
-                    "❌ <b>Failed uploads:</b>",
-                ]
-            )
-
-            lines.extend(
-                self._render_upload_failures(failures)
             )
 
         return lines
+
+    def _failure_line(self, failure: Any, icon: str) -> str:
+        name = self._short(
+            self._get_value(failure, "filename", "")
+            or self._get_value(failure, "path", "")
+            or "file",
+            self.MAX_NAME_CHARS,
+        )
+        error = self._short(
+            self._get_value(failure, "error", "") or "Unknown upload error",
+            self.MAX_REASON_CHARS,
+        )
+        return f"• {icon} <b>{name}</b> — {error}"
+
+    def _skipped_line(self, item: Any) -> str:
+        if not isinstance(item, dict):
+            return f"• 🖼️ <b>{self._short(item, self.MAX_NAME_CHARS)}</b> — skipped"
+        name = self._short(item.get("filename", "") or "image", self.MAX_NAME_CHARS)
+        size = item.get("size_bytes")
+        limit = item.get("limit_bytes")
+        if isinstance(size, int) and isinstance(limit, int) and limit > 0:
+            reason = (
+                f"over the {limit / (1024 * 1024):.0f} MiB image limit "
+                f"({size / (1024 * 1024):.1f} MiB)"
+            )
+        else:
+            reason = "over the 2 MiB image limit"
+        return f"• 🖼️ <b>{name}</b> — {reason}"
+
+    def _provider_of(self, item: Any) -> str:
+        return str(self._get_value(item, "provider", "") or "").lower()
+
+    def _provider_label_of(self, item: Any) -> str:
+        label = self._video_provider_name(item, self._get_value(item, "provider", ""))
+        return str(label or "video bot")
 
     # ------------------------------------------------------------------
     # MEDIA SUMMARY
