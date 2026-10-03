@@ -342,12 +342,8 @@ class Settings:
     # once the bot has received it (timeouts are not retried).
     video_bot_send_attempts: int = 2
     video_url_pattern: Optional[str] = None
-    # Safety limit for EACH individual video (not for the ZIP archive). With
-    # ``merge_videos`` it also applies to the merged video.
+    # Safety limit for EACH individual video (not for the ZIP archive).
     video_max_size_gb: float = 1.5
-    # MERGE_VIDEOS: when true and a ZIP holds 2+ videos they are merged into ONE
-    # video (FFmpeg stream copy, never re-encoded) before the video bots.
-    merge_videos: bool = False
 
     # Optional custom final Telegram post (FINAL_POST_TEMPLATE). Empty/None
     # keeps the built-in clean final post. May contain escaped ``\\n``.
@@ -447,8 +443,7 @@ class Settings:
             f"video_bots={list(self.video_bots)!r}, "
             f"video_bot_mode={self.video_bot_mode!r}, "
             f"video_bot_timeout_seconds={self.video_bot_timeout_seconds}, "
-            f"video_max_size_gb={self.video_max_size_gb}, "
-            f"merge_videos={self.merge_videos}"
+            f"video_max_size_gb={self.video_max_size_gb}"
             f")"
         )
 
@@ -703,10 +698,6 @@ class Settings:
             video_url_pattern=_get_str(
                 "VIDEO_URL_PATTERN",
                 default=None,
-            ),
-            merge_videos=_get_bool(
-                "MERGE_VIDEOS",
-                default=False,
             ),
             final_post_template=_get_str(
                 "FINAL_POST_TEMPLATE",

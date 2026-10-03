@@ -17,13 +17,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System dependencies. The app is pure Python; ffmpeg (which ships ffprobe) is
-# only needed for MERGE_VIDEOS (lossless stream-copy merge of multiple videos).
+# System dependencies (kept minimal - this project is pure Python)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && ffmpeg -version \
-    && ffprobe -version
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 # Dependencies first for better layer caching
 COPY requirements.txt ./

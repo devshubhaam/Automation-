@@ -108,62 +108,6 @@ timeout, failure, cancellation, shutdown).
 **One failure never affects the others.** The failed video is recorded and the next one
 runs; successful results are kept.
 
-### Merge Videos
-
-```env
-MERGE_VIDEOS=false
-```
-
-| Value | Behaviour |
-| --- | --- |
-| `false` (default) | Current behaviour, unchanged: every video is sent to the video bots on its own. |
-| `true` | A ZIP with **2 or more videos** is merged into **one** video before it is sent to the video bot(s). |
-
-With `MERGE_VIDEOS=true`:
-
-```
-ZIP → extract → scan → videos in the pipeline's existing order → FFprobe compatibility check
-    → FFmpeg stream-copy merge → ONE merged video → ONE DiskWala upload → ONE URL
-```
-
-- Works for **any number of videos** (2, 5, 10, 50, …); the count comes from the extracted ZIP.
-- **Order** is the pipeline's existing deterministic order (natural sort of the path in the ZIP:
-  `video2` before `video10`). It is never changed by upload time, size or response time.
-- Compatible videos are merged with FFmpeg's concat demuxer and **stream copy**
-  (`ffmpeg -f concat -safe 0 -i list.txt -map … -c copy out`). Nothing is re-encoded, so
-  there is **no quality degradation** in the merge. Stream copy is lossless with respect to the
-  already-encoded streams; it does **not** make incompatible source formats compatible.
-- Before merging, every source is inspected with FFprobe. These must be identical across all
-  videos: container family, number of video/audio streams, and per stream — video: codec,
-  width, height, pixel format, frame rate, sample aspect ratio, field order, profile, level,
-  colour tags; audio: codec, profile, sample rate, channels, channel layout.
-- **Incompatible videos are rejected, never silently re-encoded.** The merge is reported as a
-  failed video (the reason names the property and the two files, e.g. `'width' differs
-  (video1.mp4: 1920, video3.mp4: 1280)`), **nothing is sent to DiskWala** — not the merged file
-  and not the individual videos — and the job finishes as *completed with errors*. Images and the
-  Telegraph article are unaffected.
-- The merged file must respect `VIDEO_MAX_SIZE_GB`. If it is larger it is deleted and **not**
-  uploaded (reported as a failure). FFmpeg is also told to stop writing right past the limit, so
-  an oversized merge cannot fill the disk. Normal (non-merge) size-limit behaviour is unchanged.
-- **Exactly one video result** is produced (with the merged file's `size_bytes`), so
-  `{video_links}` contains **one** DiskWala URL instead of one per source video.
-- **Exactly one video** in the ZIP is never merged: the original is sent as before. **No videos**:
-  the image/Telegraph behaviour is unchanged. Images and Telegraph are never affected.
-- The merged file is written to `<job dir>/merged/` and removed with the job's other files
-  (unless `KEEP_JOB_FILES=true`). FFmpeg reads and writes files directly — nothing is held in
-  RAM — but the merged file needs about as much free disk space as all the videos together
-  (the merge fails with a clear message when there is not enough).
-- **Cancellation** terminates FFmpeg (then kills it if needed), removes the partial file, uploads
-  nothing and ends the job as `CANCELLED`. A missing `ffmpeg`/`ffprobe`, a corrupt source or an
-  FFmpeg error is a failed merge, never a crash, and a partial file is never uploaded.
-
-Requires `ffmpeg` and `ffprobe` (the Dockerfile installs them). Check with `ffmpeg -version` and
-`ffprobe -version`.
-
-> The compatibility check compares what FFprobe reports. Files made by the same encoder with the
-> same settings (e.g. parts of one recording) are the intended input; if a player has trouble with
-> a merged file whose sources differed in ways FFprobe cannot see, re-encode them yourself first.
-
 ### Result metadata (`job.metadata`, included in `job.to_dict()`)
 
 | Key | Content |
@@ -172,10 +116,9 @@ Requires `ffmpeg` and `ffprobe` (the Dockerfile installs them). Check with `ffmp
 | `part2_skipped_large_images` | Images > 2 MiB that were skipped |
 | `imgbb_results` | `[{filename, relative_path, url}]` for successful ImgBB uploads |
 | `telegraph_articles` | Article URL(s), only if images were uploaded |
-| `video_processing` | `"video_bot"`, `"not_required"` (or `"video_merge"` while merging / when the merge failed) |
-| `video_status` | Per video: `{filename, relative_path, status, url, error}` (`pending`, `processing`, `merging`, `done`, `failed`, `cancelled`) |
+| `video_processing` | `"video_bot"` or `"not_required"` |
+| `video_status` | Per video: `{filename, relative_path, status, url, error}` (`pending`, `processing`, `done`, `failed`, `cancelled`) |
 | `video_results` | `[{filename, relative_path, url}]` — the filename → URL mapping |
-| `video_merge` | Only with `MERGE_VIDEOS=true` and 2+ videos: `{status, mode, source_count, sources, output, size_bytes, error, reason}` (`status`: `merging`, `done`, `failed`, `cancelled`) |
 | `video_failures` | `[{filename, relative_path, error}]` |
 
 `job.upload_results` / `job.upload_failures` hold the same information as structured
@@ -244,14 +187,13 @@ Copy `.env.example` to `.env`. Required: `API_ID`, `API_HASH` (plus `BOT_TOKEN`/
 | `VIDEO_BOTS` | — | Comma-separated bots, tried in order: `@DiskWalaFileUploaderBot,@FlezenUploadBot`. Without it every video fails with a clear error. (`VIDEO_BOT_USERNAME` is the deprecated single-bot form) |
 | `VIDEO_BOT_TIMEOUT_SECONDS` | `1800` | Per-video wait for the final link after delivery (10–7200) |
 | `VIDEO_BOT_SEND_ATTEMPTS` | `2` | Delivery attempts per video (1–5) |
-| `VIDEO_MAX_SIZE_GB` | `1.5` | Per-video size limit (also the limit for the merged video when `MERGE_VIDEOS=true`) |
-| `MERGE_VIDEOS` | `false` | `true`: merge 2+ videos of a ZIP into one (FFmpeg stream copy, no re-encoding) before the video bot — see *Merge Videos* |
+| `VIDEO_MAX_SIZE_GB` | `1.5` | Per-video size limit |
 | `VIDEO_BOT_FALLBACK_ON_TIMEOUT` | `false` | Try the next bot after a timeout (may duplicate an upload) |
 | `VIDEO_BOT_REQUIRE_REPLY` | `true` | Only accept bot messages that reply to the sent video |
 | `VIDEO_URL_PATTERN` | — | Optional extra regex; DiskWala (`/app/`) and Flezen (`/s/`) links are built in |
 | `MAX_ARCHIVE_SIZE_MB` / `MAX_EXTRACTED_SIZE_MB` / `MAX_FILES_PER_ARCHIVE` | `500` / `2000` / `10000` | ZIP safety limits |
 | `DOWNLOAD_DIR`, `JOB_DIR`, `LOG_DIR`, `SESSION_DIR` | `./data/...` | Storage paths |
-| `KEEP_JOB_FILES` | `false` | Keep `archive/`, `extracted/` (and `merged/`) after a job |
+| `KEEP_JOB_FILES` | `false` | Keep `archive/` and `extracted/` after a job |
 | `WORKER_COUNT` | `1` | Pipeline workers (1–4) |
 | `LOG_LEVEL`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` | `INFO`, `5242880`, `5` | Logging |
 
@@ -295,5 +237,3 @@ failed video and a Telegraph failure not stopping the rest, the 1.5 GB limit, vi
 reaching ImgBB/Telegraph, the 4096-character final message, shutdown/cancellation and the
 `.env.example` values.
 `scripts/smoke_startup.py` is a startup/config smoke test.
-
-`tests/test_merge_videos.py` covers `MERGE_VIDEOS`: pure helpers (concat list escaping, the FFmpeg command is `-c copy` only, compatibility rules), the real merger driving fake `ffmpeg`/`ffprobe` scripts (failure, hang, cancel, oversize, missing binaries, tricky file names), the worker/pipeline integration (one upload, one URL, final post, ordering, cleanup) and — when `ffmpeg` is installed — real merges that verify decoded video frames and audio packets are identical to the sources.
