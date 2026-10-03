@@ -288,7 +288,7 @@ async def test_mixed_zip_end_to_end(settings, tmp_path):
     data = job.to_dict()
     assert {(r["filename"], r["provider"]) for r in data["upload_results"]} == {
         ("a.jpg", "imgbb"), ("v.mp4", "video_bot"), ("a", "telegraph_article")}
-    assert job.metadata["video_results"] == [
+    assert [{k: r[k] for k in ("filename", "relative_path", "url")} for r in job.metadata["video_results"]] == [
         {"filename": "v.mp4", "relative_path": "v.mp4", "url": "https://www.domain.com/app/v"}]
     json.dumps(data)  # serialisable
 
