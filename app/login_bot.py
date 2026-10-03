@@ -485,8 +485,17 @@ class LoginBot:
                     "QR login is not required"
                 )
 
-                await self._finish_login(
-                    event
+                # IMPORTANT:
+                # The main application is already using this exact
+                # authorized Telegram client/session. Do NOT call
+                # _finish_login() here because it performs get_me()
+                # again through the login command and can trigger
+                # AuthKeyDuplicatedError when the same authorization
+                # key is active elsewhere.
+                await event.reply(
+                    "✅ Userbot is already authorized.\n\n"
+                    "QR login is not required.\n"
+                    "Use /status to check the current session."
                 )
 
                 return
