@@ -69,7 +69,7 @@ def test_custom_template_renders_acceptance_example(tmp_path):
     job = finished(tmp_path, ABCD)
     assert render(job, DEFAULT_TEMPLATE) == (
         f"📝 Telegraph\n{TELEGRAPH}\n\n🎬 Videos\n\n"
-        f"{DISK}B\n{DISK}A\n{DISK}C\n{DISK}D"
+        f"{DISK}B\n\n{DISK}A\n\n{DISK}C\n\n{DISK}D"
     )
 
 
@@ -77,7 +77,7 @@ def test_second_example_template_with_title(tmp_path):
     job = finished(tmp_path, ABCD[:2])
     template = "📦 {title}\n\n🔗 Telegraph:\n{telegraph_url}\n\n🎬 Videos:\n{video_links}"
     assert render(job, template) == (
-        f"📦 My Album\n\n🔗 Telegraph:\n{TELEGRAPH}\n\n🎬 Videos:\n{DISK}B\n{DISK}A"
+        f"📦 My Album\n\n🔗 Telegraph:\n{TELEGRAPH}\n\n🎬 Videos:\n{DISK}B\n\n{DISK}A"
     )
 
 
@@ -90,7 +90,7 @@ def test_every_supported_variable(tmp_path):
         "{video_count}|{image_count}|{job_id}"
     )
     assert render(job, template) == (
-        f"{TELEGRAPH}|{DISK}B\n{DISK}A\n{DISK}C\n{DISK}D|My Album|My Album.zip|4|3|job-1"
+        f"{TELEGRAPH}|{DISK}B\n\n{DISK}A\n\n{DISK}C\n\n{DISK}D|My Album|My Album.zip|4|3|job-1"
     )
 
 
@@ -132,15 +132,15 @@ def test_upload_completion_order_does_not_matter(tmp_path):
     forward = finished(tmp_path / "f", ABCD)
     backward_videos = [ABCD[3], ABCD[2], ABCD[1], ABCD[0]]
     backward = finished(tmp_path / "b", backward_videos)
-    assert render(forward, "{video_links}").split("\n")[0] == DISK + "B"
-    assert render(backward, "{video_links}").split("\n")[0] == DISK + "B"
-    assert render(backward, "{video_links}").split("\n")[-1] == DISK + "D"
+    assert render(forward, "{video_links}").split("\n\n")[0] == DISK + "B"
+    assert render(backward, "{video_links}").split("\n\n")[0] == DISK + "B"
+    assert render(backward, "{video_links}").split("\n\n")[-1] == DISK + "D"
 
 
 def test_equal_sizes_keep_pipeline_order(tmp_path):
     job = finished(tmp_path, [
         ("c.mp4", 10, DISK + "C"), ("a.mp4", 10, DISK + "A"), ("b.mp4", 10, DISK + "B")])
-    assert render(job, "{video_links}") == f"{DISK}C\n{DISK}A\n{DISK}B"
+    assert render(job, "{video_links}") == f"{DISK}C\n\n{DISK}A\n\n{DISK}B"
 
 
 # I ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ def test_literal_braces_are_supported(tmp_path):
 def test_escaped_newlines_become_real_newlines(tmp_path):
     job = finished(tmp_path, ABCD[:2])
     text = render(job, DEFAULT_TEMPLATE)
-    assert "\\n" not in text and text.count("\n") == 6
+    assert "\\n" not in text and text.count("\n") == 7
     assert normalize_final_post_template(r"a\nb\r\nc") == "a\nb\nc"
     assert normalize_final_post_template("a\r\nb") == "a\nb"  # real multiline value
 
@@ -212,7 +212,7 @@ def test_length_limit_drops_smallest_videos_first_and_keeps_order(tmp_path):
     assert len(text) <= ProgressRenderer.MAX_MESSAGE_CHARS <= 4096
     lines = text.split("\n")
     assert lines[0] == "HEADER" and lines[1] == TELEGRAPH
-    kept = lines[2:-1]
+    kept = [l for l in lines[2:-1] if l]
     expected_all = [u for _, _, u in sorted(videos, key=lambda v: -v[1])]
     assert 0 < len(kept) < 60
     assert kept == expected_all[: len(kept)]          # largest kept, order unchanged
@@ -238,4 +238,36 @@ def test_duplicate_diskwala_urls_are_deduplicated(tmp_path):
     job = finished(tmp_path, [
         ("a.mp4", 100, DISK + "SAME"), ("a-copy.mp4", 300, DISK + "SAME"), ("b.mp4", 50, DISK + "B")])
     text = render(job, "{video_links}\n{video_count}")
-    assert text == f"{DISK}SAME\n{DISK}B\n2"
+    assert text == f"{DISK}SAME\n\n{DISK}B\n2"
+
+
+# Blank-line separation of {video_links} -------------------------------------
+
+def test_video_links_one_blank_line_between_links(tmp_path):
+    two = finished(tmp_path / "2", [("a.mp4", 2, DISK + "1"), ("b.mp4", 1, DISK + "2")])
+    assert render(two, "{video_links}") == f"{DISK}1\n\n{DISK}2"
+
+    three = finished(tmp_path / "3", [
+        ("a.mp4", 3, DISK + "1"), ("b.mp4", 2, DISK + "2"), ("c.mp4", 1, DISK + "3")])
+    text = render(three, "{video_links}")
+    assert text == f"{DISK}1\n\n{DISK}2\n\n{DISK}3"
+    assert "\n\n\n" not in text
+
+
+def test_video_links_single_and_zero_links_have_no_extra_blank_lines(tmp_path):
+    one = finished(tmp_path / "1", [("a.mp4", 1, DISK + "ONLY")])
+    assert render(one, "{video_links}") == DISK + "ONLY"
+
+    zero = finished(tmp_path / "0", [])
+    assert render(zero, "[{video_links}]|{video_count}") == f"[]|0"
+
+
+def test_blank_line_format_keeps_sorting_stability_and_filtering(tmp_path):
+    job = finished(tmp_path, [
+        ("a.mp4", 500, DISK + "A"),
+        ("b.mp4", 1200, DISK + "B"),
+        ("c.mp4", 500, DISK + "C"),
+        ("x.mp4", 9999, "https://i.ibb.co/x.jpg", "custom"),
+        ("f.mp4", 800, "https://flezen.com/s/F", "flezen"),
+    ])
+    assert render(job, "{video_links}") == f"{DISK}B\n\n{DISK}A\n\n{DISK}C"
