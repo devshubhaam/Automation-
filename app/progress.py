@@ -191,7 +191,9 @@ class ProgressRenderer:
 
         if video_count:
             done_videos = self._count_videos(results)
-            failed_videos = self._count_videos(failures)
+            failed_videos = self._count_videos(
+                [f for f in failures if not self._is_partial(f)]
+            )
 
             lines.extend(
                 [
@@ -275,11 +277,23 @@ class ProgressRenderer:
             bot = entry.get("bot")
             provider = entry.get("provider")
 
+            links = entry.get("links") or []
+            partial = entry.get("partial_errors") or []
+
             if status == "done":
                 text = "✅ URL received"
 
-                if provider:
-                    text += f" · {self._escape(self._provider_label(provider))}"
+                names = []
+                for link in links:
+                    label = self._provider_label(link.get("provider") or link.get("bot") or "")
+                    if label and label not in names:
+                        names.append(label)
+                if not names and provider:
+                    names = [self._provider_label(provider)]
+                if names:
+                    text += f" · {self._escape(', '.join(names))}"
+                if partial:
+                    text += f" · ⚠️ {len(partial)} bot failed"
 
             elif status == "failed":
                 text = f"❌ {self._escape(str(entry.get('error') or 'failed')[:120])}"
@@ -289,6 +303,8 @@ class ProgressRenderer:
 
                 if bot:
                     text += f" · @{self._escape(bot)}"
+                if links:
+                    text += f" · {len(links)} link(s) ready"
 
             elif status == "cancelled":
                 text = "🛑 Cancelled"
@@ -403,7 +419,12 @@ class ProgressRenderer:
 
         articles, image_results, video_results = self._split_results(results)
 
-        video_failures = [f for f in failures if self._provider_of(f) == "video_bot"]
+        all_video_failures = [f for f in failures if self._provider_of(f) == "video_bot"]
+        # A bot that failed while another bot still gave a link is a warning,
+        # not a failed video.
+        video_failures = [f for f in all_video_failures if not self._is_partial(f)]
+        partial_failures = [f for f in all_video_failures if self._is_partial(f)]
+        video_groups = self._group_video_links(video_results)
         image_failures = [f for f in failures if self._provider_of(f) == "imgbb"]
         article_failures = [
             f for f in failures if self._provider_of(f) == "telegraph_article"
@@ -423,11 +444,16 @@ class ProgressRenderer:
                 f" · {len(skipped)} skipped · {len(image_failures)} failed"
             )
         if video_count or video_results or video_failures:
-            total = video_count or (len(video_results) + len(video_failures))
+            total = video_count or (len(video_groups) + len(video_failures))
             lines.append(
-                f"🎬 Videos: {len(video_results)}/{total} links received"
+                f"🎬 Videos: {len(video_groups)}/{total} links received"
                 f" · {len(video_failures)} failed"
             )
+            if partial_failures:
+                lines.append(
+                    f"⚠️ Video bots: {len(partial_failures)} upload(s) failed"
+                    " (other bot links received)"
+                )
         if articles:
             lines.append("📝 Telegraph article: created")
         elif article_failures:
@@ -443,24 +469,25 @@ class ProgressRenderer:
                 if url:
                     lines.append(self._escape(str(url)))
 
-        # ---- successful videos: filename -> URL ------------------------------
-        if video_results:
+        # ---- successful videos: filename -> URL(s) ---------------------------
+        if video_groups:
             lines.extend(["", "🎬 <b>Video links:</b>"])
-            shown = video_results[: caps["video"]]
-            for result in shown:
-                name = self._short(
-                    self._get_value(result, "filename", "") or "video",
-                    self.MAX_NAME_CHARS,
-                )
-                provider = self._provider_label_of(result)
-                url = self._escape(str(self._get_value(result, "url", "")))
-                lines.append(f"• <b>{name}</b> ({self._escape(provider)})\n  {url}")
-            lines.extend(self._more(len(video_results) - len(shown)))
+            shown = video_groups[: caps["video"]]
+            for name_raw, group in shown:
+                name = self._short(name_raw or "video", self.MAX_NAME_CHARS)
+                lines.append(f"• <b>{name}</b>")
+                for result in group:
+                    provider = self._provider_label_of(result)
+                    url = self._escape(str(self._get_value(result, "url", "")))
+                    lines.append(f"  {self._escape(provider)}: {url}")
+            lines.extend(self._more(len(video_groups) - len(shown)))
 
         # ---- failures / skips with reasons -----------------------------------
         failed_entries: list[str] = []
         for failure in video_failures:
             failed_entries.append(self._failure_line(failure, "🎬"))
+        for failure in partial_failures:
+            failed_entries.append(self._failure_line(failure, "⚠️🎬"))
         for failure in article_failures:
             failed_entries.append(self._failure_line(failure, "📝"))
         for failure in image_failures:
@@ -523,6 +550,20 @@ class ProgressRenderer:
         else:
             reason = "over the 2 MiB image limit"
         return f"• 🖼️ <b>{name}</b> — {reason}"
+
+    @staticmethod
+    def _is_partial(failure: Any) -> bool:
+        """True for a failure of ONE video bot whose video got another link."""
+        extra = ProgressRenderer._get_value(failure, "extra", None)
+        return bool(isinstance(extra, dict) and extra.get("partial"))
+
+    def _group_video_links(self, video_results: list[Any]) -> list[tuple[str, list[Any]]]:
+        """Group video link results by filename (keeps first-seen order)."""
+        groups: dict[str, list[Any]] = {}
+        for result in video_results:
+            key = str(self._get_value(result, "filename", "") or "video")
+            groups.setdefault(key, []).append(result)
+        return list(groups.items())
 
     def _provider_of(self, item: Any) -> str:
         return str(self._get_value(item, "provider", "") or "").lower()
