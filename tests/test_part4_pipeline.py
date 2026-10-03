@@ -218,20 +218,14 @@ async def test_mixed_zip_end_to_end_with_one_final_message(settings, tmp_path, n
     assert status.replies == []
     assert all(kw.get("link_preview") is False for kw in status.edit_kwargs)
     final = status.edits[-1]
-    assert "https://telegra.ph/album" in final
-    for urls in links.values():
-        for url in urls.values():
-            assert url in final
-    assert "big.mp4" in final and "exceeds the size limit" in final
-    assert "huge.jpg" in final and "image limit" in final
-    assert "Completed with errors" in final
-    assert len(final) <= 4096
-
-    # Both links of a.mp4 are listed together under ITS filename.
-    assert re.search(
-        r"<b>a\.mp4</b>\n\s*DiskWala: https://www\.diskwala\.com/app/DW-a\n\s*Flezen: https://flezen\.com/s/FZ-a",
-        final,
+    # Clean final post: Telegraph first, then DiskWala links only (b.mp4 has none).
+    assert final == (
+        "📝 Telegraph\nhttps://telegra.ph/album\n\n"
+        "🎬 Videos\n\n"
+        "https://www.diskwala.com/app/DW-a\n\n"
+        "https://www.diskwala.com/app/DW-d"
     )
+    assert len(final) <= 4096
 
     # Temporary handlers were all removed; job files cleaned.
     assert client.active_handlers() == 0
@@ -325,7 +319,8 @@ async def test_failed_video_continues_with_next_video_and_is_reported(settings, 
         "v3.mp4": "https://flezen.com/s/FZ-v3",
     }
     final = job._status_message.edits[-1]
-    assert "v2.mp4" in final and "did not reply with a link" in final
+    assert "https://www.diskwala.com/app/DW-v1" in final
+    assert "v2.mp4" not in final and "did not reply" not in final  # no failure details
     assert client.active_handlers() == 0
 
 
@@ -350,8 +345,8 @@ async def test_telegraph_failure_does_not_stop_videos_and_is_in_final_message(se
     final = job._status_message.edits[-1]
     assert "https://www.diskwala.com/app/DW-a" in final
     assert "https://www.diskwala.com/app/DW-b" in final
-    assert "Telegraph article: failed" in final
-    assert "ACCESS_TOKEN_INVALID" in final
+    assert "Telegraph" not in final and "ACCESS_TOKEN_INVALID" not in final
+    assert final.startswith("🎬 Videos")
 
 
 # --------------------------------------------------------------------------- #
@@ -378,7 +373,7 @@ async def test_over_1_5_gb_video_is_rejected_with_reason_and_next_video_continue
     assert [f["filename"] for f in job.metadata["video_failures"]] == ["huge.mp4"]
     assert [r["filename"] for r in job.metadata["video_results"]] == ["ok.mp4"]
     final = job._status_message.edits[-1]
-    assert "huge.mp4" in final and "exceeds the size limit" in final
+    assert "huge.mp4" not in final and "exceeds" not in final
     assert "https://www.diskwala.com/app/DW-ok" in final
 
 
@@ -404,7 +399,7 @@ async def test_videos_never_reach_imgbb_or_telegraph_in_the_full_pipeline(settin
     sent_to_telegraph = " ".join(url for _, urls in telegraph.calls for url in urls)
     assert "clip" not in sent_to_telegraph and "diskwala" not in sent_to_telegraph
     assert {name for _, name, _ in client.sent} == {"clip.mp4", "clip2.mkv"}
-    assert "Processing completed successfully" in job._status_message.edits[-1]
+    assert job._status_message.edits[-1].startswith("📝 Telegraph\nhttps://telegra.ph/")
 
 
 # --------------------------------------------------------------------------- #
@@ -416,8 +411,8 @@ def test_final_message_always_fits_into_one_telegram_message(settings):
     manager = JobManager(settings.job_dir)
     job = make_job(manager)
     prep(manager, job)
-    manager.set_media_counts(job.job_id, image_count=300, video_count=60)
-    from app.job_manager import UploadFailure, UploadResult
+    manager.set_media_counts(job.job_id, image_count=300, video_count=200)
+    from app.job_manager import UploadResult
 
     for i in range(300):
         manager.add_upload_result(job.job_id, UploadResult(
@@ -426,27 +421,83 @@ def test_final_message_always_fits_into_one_telegram_message(settings):
     manager.add_upload_result(job.job_id, UploadResult(
         media_type="article", filename="album", provider="telegraph_article",
         url="https://telegra.ph/album-10-03"))
-    for i in range(40):
+    for i in range(200):
         manager.add_upload_result(job.job_id, UploadResult(
-            media_type="video", filename=f"a-rather-long-video-name-{i}.mp4", provider="video_bot",
-            url=f"https://www.diskwala.com/app/{i:024d}", extra={"provider_name": "diskwala"}))
-    for i in range(20):
-        manager.add_upload_failure(job.job_id, UploadFailure(
-            provider="video_bot", media_type="video", filename=f"bad-{i}.mp4", error="timeout " * 80))
-    manager.set_metadata(job.job_id, "part2_skipped_large_images", [
-        {"filename": f"big-{i}.jpg", "size_bytes": 5 * 1024 * 1024, "limit_bytes": PART2_IMAGE_MAX_BYTES}
-        for i in range(50)])
+            media_type="video", filename=f"v{i}.mp4", provider="video_bot",
+            url=f"https://www.diskwala.com/app/{i:024d}", size_bytes=1000 + i,
+            extra={"provider_name": "diskwala"}))
     manager.complete_with_errors(job.job_id)
 
     text = ProgressRenderer().render(job)
 
     assert len(text) <= 4096
-    assert "https://telegra.ph/album-10-03" in text          # highest priority survives
-    assert "a-rather-long-video-name-0.mp4" in text and "bad-0.mp4" in text
-    assert "Completed with errors" in text
+    assert text.startswith("📝 Telegraph\nhttps://telegra.ph/album-10-03")  # always kept
+    assert f"{199:024d}" in text                      # biggest video survives
+    assert f"{0:024d}" not in text                    # smallest are cut first
+    assert re.search(r"… \+\d+ more$", text)
 
 
-def test_small_final_message_shows_everything(settings):
+def test_clean_final_post_sorts_diskwala_links_by_video_size_descending(settings):
+    manager = JobManager(settings.job_dir)
+    job = make_job(manager)
+    prep(manager, job)
+    from app.job_manager import UploadResult
+
+    manager.add_upload_result(job.job_id, UploadResult(
+        media_type="article", filename="album", provider="telegraph_article", url="https://telegra.ph/a"))
+    for name, size, url, prov in (
+        ("small.mp4", 10, "https://www.diskwala.com/app/SMALL", "diskwala"),
+        ("big.mp4", 3000, "https://www.diskwala.com/app/BIG", "diskwala"),
+        ("big.mp4", 3000, "https://flezen.com/s/BIGF", "flezen"),       # never shown
+        ("mid.mp4", 500, "https://www.diskwala.com/app/MID", "diskwala"),
+    ):
+        manager.add_upload_result(job.job_id, UploadResult(
+            media_type="video", filename=name, provider="video_bot", url=url,
+            size_bytes=size, extra={"provider_name": prov}))
+    manager.add_upload_result(job.job_id, UploadResult(
+        media_type="image", filename="i.jpg", provider="imgbb", url="https://i.ibb.co/i.jpg"))
+    manager.complete(job.job_id)
+
+    assert ProgressRenderer().render(job) == (
+        "📝 Telegraph\nhttps://telegra.ph/a\n\n"
+        "🎬 Videos\n\n"
+        "https://www.diskwala.com/app/BIG\n\n"
+        "https://www.diskwala.com/app/MID\n\n"
+        "https://www.diskwala.com/app/SMALL"
+    )
+
+
+def test_clean_final_post_has_no_header_names_counts_or_status(settings):
+    manager = JobManager(settings.job_dir)
+    job = make_job(manager)
+    prep(manager, job)
+    from app.job_manager import UploadResult
+
+    manager.set_media_counts(job.job_id, image_count=2, video_count=1)
+    manager.add_upload_result(job.job_id, UploadResult(
+        media_type="video", filename="secret-name.mp4", provider="video_bot",
+        url="https://www.diskwala.com/app/X&Y", size_bytes=5, extra={"provider_name": "diskwala"}))
+    manager.complete(job.job_id)
+
+    text = ProgressRenderer().render(job)
+
+    assert text == "🎬 Videos\n\nhttps://www.diskwala.com/app/X&amp;Y"
+    for banned in ("Media Processor", "Job", "Status", "secret-name", "Images", "Completed", "Media summary"):
+        assert banned not in text
+
+
+def test_failed_cancelled_and_empty_jobs_keep_the_detailed_report(settings):
+    manager = JobManager(settings.job_dir)
+    job = make_job(manager)
+    prep(manager, job)
+    manager.complete_with_errors(job.job_id)          # nothing to link -> detailed report
+
+    text = ProgressRenderer().render(job)
+
+    assert "Media Processor" in text and "Completed with errors" in text
+
+
+def test_small_final_message_shows_telegraph_then_video_link(settings):
     manager = JobManager(settings.job_dir)
     job = make_job(manager)
     prep(manager, job)
@@ -455,15 +506,13 @@ def test_small_final_message_shows_everything(settings):
     manager.add_upload_result(job.job_id, UploadResult(
         media_type="article", filename="album", provider="telegraph_article", url="https://telegra.ph/a"))
     manager.add_upload_result(job.job_id, UploadResult(
-        media_type="video", filename="v<1>.mp4", provider="video_bot", url="https://flezen.com/s/FZ1",
-        extra={"provider_name": "flezen"}))
+        media_type="video", filename="v<1>.mp4", provider="video_bot", url="https://www.diskwala.com/app/D1",
+        size_bytes=7, extra={"provider_name": "diskwala"}))
     manager.complete(job.job_id)
 
-    text = ProgressRenderer().render(job)
-
-    assert "https://telegra.ph/a" in text
-    assert "v&lt;1&gt;.mp4" in text and "Flezen: https://flezen.com/s/FZ1" in text
-    assert "Completed" in text
+    assert ProgressRenderer().render(job) == (
+        "📝 Telegraph\nhttps://telegra.ph/a\n\n🎬 Videos\n\nhttps://www.diskwala.com/app/D1"
+    )
 
 
 @pytest.mark.asyncio
@@ -649,10 +698,10 @@ async def test_every_video_gets_a_diskwala_and_a_flezen_link(settings, tmp_path,
         (DISK, "one.mp4"), (FLEZEN, "one.mp4"), (DISK, "two.mp4"), (FLEZEN, "two.mp4"),
     ]  # strictly sequential, DiskWala first
     final = job._status_message.edits[-1]
-    for name, stem in (("one.mp4", "one"), ("two.mp4", "two")):
-        assert f"DiskWala: https://www.diskwala.com/app/DW-{stem}" in final
-        assert f"Flezen: https://flezen.com/s/FZ-{stem}" in final
-    assert "Videos: 2/2 links received" in final
+    # Both bots were used (see client.sent) but the final post shows DiskWala only.
+    assert "https://www.diskwala.com/app/DW-one" in final
+    assert "https://www.diskwala.com/app/DW-two" in final
+    assert "flezen" not in final.lower() and ".mp4" not in final
     assert client.active_handlers() == 0
 
 
@@ -678,8 +727,9 @@ async def test_slow_flezen_is_waited_for_and_diskwala_link_is_kept_if_it_times_o
     }
     assert job.status == JobStatus.COMPLETED_WITH_ERRORS
     final = job._status_message.edits[-1]
-    assert "slow.mp4" in final and f"@{FLEZEN}: Video bot did not reply with a link" in final
-    assert "Videos: 2/2 links received" in final
+    assert "https://www.diskwala.com/app/DW-slow" in final
+    assert "https://www.diskwala.com/app/DW-next" in final
+    assert "slow.mp4" not in final and "did not reply" not in final
 
 
 @pytest.mark.asyncio
@@ -699,7 +749,8 @@ async def test_video_fails_only_when_every_bot_failed_and_next_video_continues(s
     assert [f["filename"] for f in job.metadata["video_failures"]] == ["bad.mp4"]
     assert {r["filename"] for r in job.metadata["video_results"]} == {"good.mp4"}
     final = job._status_message.edits[-1]
-    assert "Videos: 1/2 links received · 1 failed" in final
+    assert final == "🎬 Videos\n\nhttps://www.diskwala.com/app/DW-good"
+    assert "bad" not in final
 
 
 @pytest.mark.asyncio
@@ -755,3 +806,23 @@ def test_zip_names_stored_as_utf8_without_the_flag_are_repaired(tmp_path):
 
     assert zipfile.ZipFile(path).namelist()[0] != "clip \u00e9\U0001F62D.mp4"  # python alone garbles it
     assert iter_member_names(path) == ["clip \u00e9\U0001F62D.mp4"]
+
+
+@pytest.mark.asyncio
+async def test_final_post_orders_real_pipeline_links_by_original_video_size(settings, tmp_path, no_events):
+    settings = part4_settings(settings)
+    plan = {(DISK, n): "ok" for n in ("small.mp4", "big.mp4", "mid.mp4")}
+    client = MultiClient(bot_behaviour(plan), fail_send_for=())
+    entries = {"small.mp4": b"s" * 10, "big.mp4": b"b" * 300, "mid.mp4": b"m" * 100}
+    worker, manager, job, *_ = run_job_setup(settings, tmp_path, entries, client)
+
+    await worker._process(job)
+
+    assert {r.filename: r.size_bytes for r in job.upload_results if r.media_type == "video"} == {
+        "small.mp4": 10, "big.mp4": 300, "mid.mp4": 100}
+    assert job._status_message.edits[-1] == (
+        "🎬 Videos\n\n"
+        "https://www.diskwala.com/app/DW-big\n\n"
+        "https://www.diskwala.com/app/DW-mid\n\n"
+        "https://www.diskwala.com/app/DW-small"
+    )
