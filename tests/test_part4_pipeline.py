@@ -139,7 +139,7 @@ def run_job_setup(settings, tmp_path, entries, client, *, imgbb=None, telegraph=
         settings,
         imgbb=imgbb,
         telegraph=telegraph,
-        video=uploader or multi(max_size_bytes=settings.video_max_size_bytes),
+        video=uploader or multi(max_size_bytes=settings.video_max_size_bytes, mode=settings.video_bot_mode),
     )
     zip_path = build_zip(tmp_path / "album.zip", entries)
     job = manager.create_job(user_id=1, chat_id=1, archive_name="album.zip", message_id=1)
@@ -158,10 +158,12 @@ def run_job_setup(settings, tmp_path, entries, client, *, imgbb=None, telegraph=
 async def test_mixed_zip_end_to_end_with_one_final_message(settings, tmp_path, no_events):
     settings = part4_settings(settings, video_max_size_gb=30_000 / (1024**3))  # 30 KB per video
     plan = {
-        (DISK, "a.mp4"): "ok",                 # DiskWala works
-        (DISK, "b.mp4"): "reject",             # DiskWala refuses -> Flezen
-        (FLEZEN, "b.mp4"): "edit",             # Flezen: placeholder, then edit -> URL
-        (DISK, "d.mp4"): "ok",
+        (DISK, "a.mp4"): "ok",                 # a: DiskWala AND Flezen
+        (FLEZEN, "a.mp4"): "edit",             # Flezen: placeholder, then edit -> URL
+        (DISK, "b.mp4"): "reject",             # b: DiskWala refuses, Flezen works
+        (FLEZEN, "b.mp4"): "ok",
+        (DISK, "d.mp4"): "ok",                 # d: DiskWala works, Flezen refuses
+        (FLEZEN, "d.mp4"): "reject",
     }
     client = MultiClient(bot_behaviour(plan), fail_send_for=())
     entries = {
@@ -189,18 +191,26 @@ async def test_mixed_zip_end_to_end_with_one_final_message(settings, tmp_path, n
     assert len(telegraph.calls) == 1
     assert sorted(telegraph.calls[0][1]) == ["https://imgbb.test/1.jpg", "https://imgbb.test/2.png"]
 
-    # Videos: correct video -> correct URL (and provider).
-    mapping = {r["filename"]: r["url"] for r in job.metadata["video_results"]}
-    assert mapping == {
-        "a.mp4": "https://www.diskwala.com/app/DW-a",
-        "b.mp4": "https://flezen.com/s/FZ-b",
-        "d.mp4": "https://www.diskwala.com/app/DW-d",
+    # Videos: EVERY video went to EVERY bot; correct video -> correct URL per bot.
+    links: dict[str, dict[str, str]] = {}
+    for r in job.metadata["video_results"]:
+        links.setdefault(r["filename"], {})[r["bot"]] = r["url"]
+    assert links == {
+        "a.mp4": {DISK: "https://www.diskwala.com/app/DW-a", FLEZEN: "https://flezen.com/s/FZ-a"},
+        "b.mp4": {FLEZEN: "https://flezen.com/s/FZ-b"},
+        "d.mp4": {DISK: "https://www.diskwala.com/app/DW-d"},
     }
     # big.mp4 never reached any bot.
     assert "big.mp4" not in {name for _, name, _ in client.sent}
-    assert [f["filename"] for f in job.metadata["video_failures"]] == ["big.mp4"]
+    assert {(bot, name) for bot, name, _ in client.sent} == {
+        (DISK, "a.mp4"), (FLEZEN, "a.mp4"),
+        (DISK, "b.mp4"), (FLEZEN, "b.mp4"),
+        (DISK, "d.mp4"), (FLEZEN, "d.mp4"),
+    }
+    failed = {(f["filename"], f["status"]) for f in job.metadata["video_failures"]}
+    assert failed == {("big.mp4", "failed"), ("b.mp4", "partial"), ("d.mp4", "partial")}
 
-    # Overall: failed video => completed with errors; skipped image alone would not.
+    # Overall: failed video / failed bot => completed with errors.
     assert job.status == JobStatus.COMPLETED_WITH_ERRORS
 
     # ONE message, edited in place (no new messages) and ending in the full result.
@@ -209,17 +219,19 @@ async def test_mixed_zip_end_to_end_with_one_final_message(settings, tmp_path, n
     assert all(kw.get("link_preview") is False for kw in status.edit_kwargs)
     final = status.edits[-1]
     assert "https://telegra.ph/album" in final
-    assert "a.mp4" in final and "https://www.diskwala.com/app/DW-a" in final
-    assert "b.mp4" in final and "https://flezen.com/s/FZ-b" in final
-    assert "d.mp4" in final and "https://www.diskwala.com/app/DW-d" in final
+    for urls in links.values():
+        for url in urls.values():
+            assert url in final
     assert "big.mp4" in final and "exceeds the size limit" in final
     assert "huge.jpg" in final and "image limit" in final
     assert "Completed with errors" in final
     assert len(final) <= 4096
 
-    # Each URL is listed under ITS filename (the line after the filename).
-    for name, url in mapping.items():
-        assert re.search(rf"<b>{re.escape(name)}</b>[^\n]*\n\s*{re.escape(url)}", final)
+    # Both links of a.mp4 are listed together under ITS filename.
+    assert re.search(
+        r"<b>a\.mp4</b>\n\s*DiskWala: https://www\.diskwala\.com/app/DW-a\n\s*Flezen: https://flezen\.com/s/FZ-a",
+        final,
+    )
 
     # Temporary handlers were all removed; job files cleaned.
     assert client.active_handlers() == 0
@@ -378,7 +390,10 @@ async def test_over_1_5_gb_video_is_rejected_with_reason_and_next_video_continue
 @pytest.mark.asyncio
 async def test_videos_never_reach_imgbb_or_telegraph_in_the_full_pipeline(settings, tmp_path, no_events):
     settings = part4_settings(settings)
-    client = MultiClient(bot_behaviour({(DISK, "clip.mp4"): "ok", (DISK, "clip2.mkv"): "ok"}))
+    client = MultiClient(bot_behaviour({
+        (DISK, "clip.mp4"): "ok", (FLEZEN, "clip.mp4"): "ok",
+        (DISK, "clip2.mkv"): "ok", (FLEZEN, "clip2.mkv"): "ok",
+    }))
     entries = {"p.jpg": b"img", "clip.mp4": b"V" * 30, "clip2.mkv": b"W" * 30}
     worker, manager, job, imgbb, telegraph = run_job_setup(settings, tmp_path, entries, client)
 
@@ -447,7 +462,7 @@ def test_small_final_message_shows_everything(settings):
     text = ProgressRenderer().render(job)
 
     assert "https://telegra.ph/a" in text
-    assert "v&lt;1&gt;.mp4" in text and "(Flezen)" in text and "https://flezen.com/s/FZ1" in text
+    assert "v&lt;1&gt;.mp4" in text and "Flezen: https://flezen.com/s/FZ1" in text
     assert "Completed" in text
 
 
@@ -599,6 +614,144 @@ def test_env_example_is_read_by_settings(tmp_path, monkeypatch):
     settings = Settings.from_env(env)
 
     assert settings.video_bots == (DISK, FLEZEN)
+    assert settings.video_bot_mode == "all"
     assert settings.video_bot_timeout_seconds == 1800
     assert settings.video_bot_send_attempts == 2
     assert settings.video_max_size_bytes == LIMIT
+
+
+# --------------------------------------------------------------------------- #
+# 10. "all bots" mode (VIDEO_BOT_MODE=all, the default)
+# --------------------------------------------------------------------------- #
+
+
+def test_all_bots_mode_is_the_default_and_validated(settings):
+    assert settings.video_bot_mode == "all"
+    assert dataclasses.replace(settings, video_bot_mode=" FALLBACK ").video_bot_mode == "fallback"
+    with pytest.raises(Exception):
+        dataclasses.replace(settings, video_bot_mode="both")
+
+
+@pytest.mark.asyncio
+async def test_every_video_gets_a_diskwala_and_a_flezen_link(settings, tmp_path, no_events):
+    settings = part4_settings(settings)
+    plan = {(b, n): "ok" for b in (DISK, FLEZEN) for n in ("one.mp4", "two.mp4")}
+    client = MultiClient(bot_behaviour(plan), fail_send_for=())
+    worker, manager, job, imgbb, telegraph = run_job_setup(
+        settings, tmp_path, {"one.mp4": b"1" * 20, "two.mp4": b"2" * 20}, client
+    )
+
+    await worker._process(job)
+
+    assert job.status == JobStatus.COMPLETED
+    assert imgbb.calls == [] and telegraph.calls == []
+    assert [(b, n) for b, n, _ in client.sent] == [
+        (DISK, "one.mp4"), (FLEZEN, "one.mp4"), (DISK, "two.mp4"), (FLEZEN, "two.mp4"),
+    ]  # strictly sequential, DiskWala first
+    final = job._status_message.edits[-1]
+    for name, stem in (("one.mp4", "one"), ("two.mp4", "two")):
+        assert f"DiskWala: https://www.diskwala.com/app/DW-{stem}" in final
+        assert f"Flezen: https://flezen.com/s/FZ-{stem}" in final
+    assert "Videos: 2/2 links received" in final
+    assert client.active_handlers() == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_flezen_is_waited_for_and_diskwala_link_is_kept_if_it_times_out(settings, tmp_path, no_events):
+    settings = part4_settings(settings)
+    plan = {
+        (DISK, "slow.mp4"): "ok",           # Flezen never answers -> timeout
+        (DISK, "next.mp4"): "ok", (FLEZEN, "next.mp4"): "chain",
+    }
+    client = MultiClient(bot_behaviour(plan), fail_send_for=())
+    worker, manager, job, *_ = run_job_setup(
+        settings, tmp_path, {"slow.mp4": b"s" * 20, "next.mp4": b"n" * 20}, client
+    )
+
+    await worker._process(job)
+
+    urls = {(r["filename"], r["bot"]): r["url"] for r in job.metadata["video_results"]}
+    assert urls == {
+        ("slow.mp4", DISK): "https://www.diskwala.com/app/DW-slow",
+        ("next.mp4", DISK): "https://www.diskwala.com/app/DW-next",
+        ("next.mp4", FLEZEN): "https://flezen.com/s/FZ-next",
+    }
+    assert job.status == JobStatus.COMPLETED_WITH_ERRORS
+    final = job._status_message.edits[-1]
+    assert "slow.mp4" in final and f"@{FLEZEN}: Video bot did not reply with a link" in final
+    assert "Videos: 2/2 links received" in final
+
+
+@pytest.mark.asyncio
+async def test_video_fails_only_when_every_bot_failed_and_next_video_continues(settings, tmp_path, no_events):
+    settings = part4_settings(settings)
+    plan = {
+        (DISK, "bad.mp4"): "reject", (FLEZEN, "bad.mp4"): "reject",
+        (DISK, "good.mp4"): "ok", (FLEZEN, "good.mp4"): "ok",
+    }
+    client = MultiClient(bot_behaviour(plan), fail_send_for=())
+    worker, manager, job, *_ = run_job_setup(
+        settings, tmp_path, {"bad.mp4": b"b" * 20, "good.mp4": b"g" * 20}, client
+    )
+
+    await worker._process(job)
+
+    assert [f["filename"] for f in job.metadata["video_failures"]] == ["bad.mp4"]
+    assert {r["filename"] for r in job.metadata["video_results"]} == {"good.mp4"}
+    final = job._status_message.edits[-1]
+    assert "Videos: 1/2 links received · 1 failed" in final
+
+
+@pytest.mark.asyncio
+async def test_fallback_mode_still_works(settings, tmp_path, no_events):
+    settings = part4_settings(settings, video_bot_mode="fallback")
+    plan = {(DISK, "x.mp4"): "ok", (FLEZEN, "x.mp4"): "ok"}
+    client = MultiClient(bot_behaviour(plan), fail_send_for=())
+    worker, manager, job, *_ = run_job_setup(settings, tmp_path, {"x.mp4": b"x" * 20}, client)
+
+    await worker._process(job)
+
+    assert [(b, n) for b, n, _ in client.sent] == [(DISK, "x.mp4")]  # Flezen never used
+    assert [r["bot"] for r in job.metadata["video_results"]] == [DISK]
+
+
+@pytest.mark.asyncio
+async def test_links_already_received_survive_a_cancel(settings, tmp_path, no_events):
+    settings = part4_settings(settings)
+    plan = {(DISK, "c.mp4"): "ok"}      # Flezen stays silent until we cancel
+    client = MultiClient(bot_behaviour(plan), fail_send_for=())
+    worker, manager, job, *_ = run_job_setup(settings, tmp_path, {"c.mp4": b"c" * 20}, client)
+
+    async def cancel_when_diskwala_done():
+        while not job.upload_results:
+            await asyncio.sleep(0.01)
+        job.cancel_requested = True
+
+    task = asyncio.create_task(cancel_when_diskwala_done())
+    await worker._process(job)
+    await task
+
+    assert job.status == JobStatus.CANCELLED
+    assert [(r.filename, r.extra["bot"]) for r in job.upload_results if r.media_type == "video"] == [("c.mp4", DISK)]
+    assert client.active_handlers() == 0
+
+
+def test_zip_names_stored_as_utf8_without_the_flag_are_repaired(tmp_path):
+    import zipfile
+    from app.archive_processor import iter_member_names
+
+    path = tmp_path / "phone.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        info = zipfile.ZipInfo("clip \u00e9\U0001F62D.mp4")
+        archive.writestr(info, b"x")
+    raw = bytearray(path.read_bytes())
+    # Simulate a phone zip tool: UTF-8 name bytes, but the UTF-8 flag (bit 11) cleared.
+    for sig in (b"PK\x03\x04", b"PK\x01\x02"):
+        pos = raw.find(sig)
+        off = pos + (6 if sig == b"PK\x03\x04" else 8)
+        flags = int.from_bytes(raw[off:off + 2], "little") & ~0x800
+        raw[off:off + 2] = flags.to_bytes(2, "little")
+    path.write_bytes(bytes(raw))
+
+    assert zipfile.ZipFile(path).namelist()[0] != "clip \u00e9\U0001F62D.mp4"  # python alone garbles it
+    assert iter_member_names(path) == ["clip \u00e9\U0001F62D.mp4"]
