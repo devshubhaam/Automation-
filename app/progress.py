@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Iterable
 
 from .job_manager import Job, JobStatus
@@ -38,6 +40,11 @@ class ProgressRenderer:
 
     def render(self, job: Job) -> str:
         """Render the current state of a job."""
+
+        # Finished jobs get the clean final post (Telegraph + DiskWala links).
+        clean = self._render_clean_final(job)
+        if clean is not None:
+            return clean
 
         icon = self.STATUS_ICONS.get(job.status, "ℹ️")
 
@@ -359,6 +366,86 @@ class ProgressRenderer:
         {"video": 3, "failed": 2, "skipped": 1, "imgbb": 0},
         {"video": 0, "failed": 0, "skipped": 0, "imgbb": 0},
     )
+
+    # ------------------------------------------------------------------
+    # CLEAN FINAL POST
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_diskwala_url(url: str) -> bool:
+        return bool(re.match(r"https?://(?:www\.)?diskwala\.com/", url.strip(), re.IGNORECASE))
+
+    def _render_clean_final(self, job: Job) -> str | None:
+        """The final post of a finished job.
+
+            📝 Telegraph
+            <article url>
+
+            🎬 Videos
+
+            <DiskWala link, biggest video first>
+            ...
+
+        No header, filenames, ImgBB links, counts or error details. Returns
+        ``None`` when the job is not finished or there is nothing to show (the
+        detailed report is used then). Links are cut from the END (smallest
+        videos) so the post always fits into one Telegram message.
+        """
+
+        if job.status not in (JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_ERRORS):
+            return None
+
+        results = list(getattr(job, "upload_results", []) or [])
+        articles, _images, video_results = self._split_results(results)
+
+        telegraph_url = ""
+        for article in articles:
+            url = str(self._get_value(article, "url", "") or "").strip()
+            if url:
+                telegraph_url = url
+                break
+
+        # DiskWala links only, biggest original video first (stable for ties).
+        indexed: list[tuple[int, int, str]] = []
+        seen: set[str] = set()
+        for position, result in enumerate(video_results):
+            url = str(self._get_value(result, "url", "") or "").strip()
+            if not url or url in seen or not self._is_diskwala_url(url):
+                continue
+            seen.add(url)
+            try:
+                size = int(self._get_value(result, "size_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            indexed.append((-size, position, url))
+        indexed.sort()
+        video_urls = [url for _, _, url in indexed]
+
+        if not telegraph_url and not video_urls:
+            return None
+
+        head: list[str] = []
+        if telegraph_url:
+            head.extend(["📝 Telegraph", self._escape(telegraph_url)])
+
+        def build(count: int) -> str:
+            lines = list(head)
+            if video_urls:
+                if lines:
+                    lines.append("")
+                lines.extend(["🎬 Videos", ""])
+                shown = [self._escape(u) for u in video_urls[:count]]
+                lines.append("\n\n".join(shown))
+                if count < len(video_urls):
+                    lines.extend(["", f"… +{len(video_urls) - count} more"])
+            return "\n".join(lines)
+
+        count = len(video_urls)
+        text = build(count)
+        while count > 0 and len(text) > self.MAX_MESSAGE_CHARS:
+            count -= 1
+            text = build(count)
+        return text
 
     def _render_completed(self, job: Job) -> list[str]:
         return self._render_final(
