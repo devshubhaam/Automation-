@@ -333,6 +333,10 @@ class Settings:
     # Safety limit for EACH individual video (not for the ZIP archive).
     video_max_size_gb: float = 1.5
 
+    # Optional custom final Telegram post (FINAL_POST_TEMPLATE). Empty/None
+    # keeps the built-in clean final post. May contain escaped ``\\n``.
+    final_post_template: Optional[str] = None
+
     # ----------------------------------------------------------------------- #
     # Derived values
     # ----------------------------------------------------------------------- #
@@ -677,6 +681,10 @@ class Settings:
             ) or 1.5,
             video_url_pattern=_get_str(
                 "VIDEO_URL_PATTERN",
+                default=None,
+            ),
+            final_post_template=_get_str(
+                "FINAL_POST_TEMPLATE",
                 default=None,
             ),
         )
