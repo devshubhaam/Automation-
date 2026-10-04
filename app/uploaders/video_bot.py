@@ -15,6 +15,14 @@ Two layers
     applies the deterministic fallback policy below. This is what the pipeline
     uses. Bot usernames are NEVER hard-coded; they come from ``VIDEO_BOTS``.
 
+Sequential workflow (one video at a time)
+=========================================
+For every video: send it -> wait for THAT video's reply (``VIDEO_LINK_TIMEOUT``,
+default 900 s, counted from the moment the file was delivered) -> the moment
+the link arrives the caller moves on to the next video. Only after the full
+timeout is a video failed ("Link not received"). Progress is logged at every
+step: sending, waiting for reply, URL received, timeout.
+
 Mapping video -> link (the critical part)
 =========================================
 * Videos are sent strictly one at a time (locks), never to two bots at once.
@@ -89,6 +97,10 @@ from .common import UploadCancelled, UploadError
 
 logger = logging.getLogger("app.video_bot")
 
+#: Default wait for ONE video's link after the file was delivered: 15 minutes
+#: (``VIDEO_LINK_TIMEOUT``).
+DEFAULT_LINK_TIMEOUT_SECONDS = 900.0
+
 #: Default per-video size limit: 1.5 GB.
 DEFAULT_VIDEO_MAX_BYTES = 1536 * 1024 * 1024
 
@@ -130,6 +142,7 @@ __all__ = [
     "VideoUploadFailed",
     "video_too_large_message",
     "DEFAULT_VIDEO_MAX_BYTES",
+    "DEFAULT_LINK_TIMEOUT_SECONDS",
     "DEFAULT_URL_PATTERN",
     "PROVIDER_URL_PATTERNS",
     "PROVIDER_LABELS",
@@ -290,7 +303,7 @@ class VideoBotUploader:
         bot_username: str | None,
         client_provider: Callable[[], Any] | None = None,
         *,
-        timeout_seconds: float = 1800.0,
+        timeout_seconds: float = DEFAULT_LINK_TIMEOUT_SECONDS,
         url_pattern: str | None = None,
         poll_seconds: float = 1.0,
         max_size_bytes: int = DEFAULT_VIDEO_MAX_BYTES,
@@ -327,8 +340,13 @@ class VideoBotUploader:
         *,
         client: Any = None,
         should_cancel: Callable[[], bool] | None = None,
+        on_sent: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
-        """Send ``path`` to the bot; return ``{"provider": "video_bot", "url": ...}``."""
+        """Send ``path`` to the bot; return ``{"provider": "video_bot", "url": ...}``.
+
+        ``on_sent()`` (sync or async) is called once the file was delivered and
+        the wait for the bot's link starts.
+        """
         path = Path(path)
         if not self.bot_username:
             raise UploadError("VIDEO_BOT_USERNAME is not configured")
@@ -348,13 +366,14 @@ class VideoBotUploader:
         async with self._lock:
             if should_cancel and should_cancel():
                 raise UploadCancelled()
-            return await self._send_and_wait(client, path, should_cancel)
+            return await self._send_and_wait(client, path, should_cancel, on_sent)
 
     async def _send_and_wait(
         self,
         client: Any,
         path: Path,
         should_cancel: Callable[[], bool] | None,
+        on_sent: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
@@ -392,6 +411,10 @@ class VideoBotUploader:
 
             url = extract_url(message, self._pattern)
             if url:
+                logger.info(
+                    "URL received for %s from @%s (reply to message %s): %s",
+                    path.name, self.bot_username, reply_to if replies_to_current else msg_id, url,
+                )
                 future.set_result(url)
                 return
 
@@ -418,12 +441,28 @@ class VideoBotUploader:
                 consider(message)
 
             # The bot has the file now: never re-send it, only wait.
+            logger.info(
+                "Waiting for @%s's reply to %s (message %s, up to %ss)",
+                self.bot_username, path.name, state["sent_id"], int(self.timeout_seconds),
+            )
+            if on_sent is not None:
+                try:
+                    outcome = on_sent()
+                    if inspect.isawaitable(outcome):
+                        await outcome
+                except Exception:
+                    logger.debug("on_sent callback failed", exc_info=True)
+
             deadline = loop.time() + self.timeout_seconds
             while not future.done():
                 if should_cancel and should_cancel():
                     raise UploadCancelled()
                 remaining = deadline - loop.time()
                 if remaining <= 0:
+                    logger.warning(
+                        "Timeout: no link from @%s for %s within %ss",
+                        self.bot_username, path.name, int(self.timeout_seconds),
+                    )
                     raise VideoTimeoutError(
                         f"Video bot did not reply with a link within {int(self.timeout_seconds)}s"
                     )
@@ -520,13 +559,15 @@ class MultiVideoBotUploader:
     supports_progress_callback = True
     #: The pipeline passes ``on_link`` (called for every received link).
     supports_link_callback = True
+    #: The pipeline passes ``on_sent`` (called when a bot received the file).
+    supports_sent_callback = True
 
     def __init__(
         self,
         bots: Sequence[str] | None,
         client_provider: Callable[[], Any] | None = None,
         *,
-        timeout_seconds: float = 1800.0,
+        timeout_seconds: float = DEFAULT_LINK_TIMEOUT_SECONDS,
         extra_url_pattern: str | None = None,
         poll_seconds: float = 1.0,
         max_size_bytes: int = DEFAULT_VIDEO_MAX_BYTES,
@@ -601,6 +642,7 @@ class MultiVideoBotUploader:
         should_cancel: Callable[[], bool] | None = None,
         on_attempt: Callable[[str, int, int], Any] | None = None,
         on_link: Callable[[dict[str, str]], Any] | None = None,
+        on_sent: Callable[[str], Any] | None = None,
     ) -> dict[str, Any]:
         """Send ``path`` to the bots and return the link(s).
 
@@ -613,6 +655,8 @@ class MultiVideoBotUploader:
         ``on_attempt(bot, index, total)`` is called (sync or async) right
         before a bot is tried, ``on_link(link)`` right after a bot returned
         its link (so it is kept even if a later bot or a cancel interrupts).
+        ``on_sent(bot)`` is called once that bot has received the file (the wait
+        for its link starts).
         """
         path = Path(path)
         if not self.uploaders:
@@ -633,8 +677,8 @@ class MultiVideoBotUploader:
 
         async with self._lock:
             if self.mode == "all":
-                return await self._try_all(path, client, should_cancel, on_attempt, on_link)
-            return await self._try_bots(path, client, should_cancel, on_attempt, on_link)
+                return await self._try_all(path, client, should_cancel, on_attempt, on_link, on_sent)
+            return await self._try_bots(path, client, should_cancel, on_attempt, on_link, on_sent)
 
     @staticmethod
     async def _call(callback: Callable[..., Any] | None, *args: Any) -> None:
@@ -647,6 +691,15 @@ class MultiVideoBotUploader:
                 await outcome
         except Exception:
             logger.debug("progress callback failed", exc_info=True)
+
+    @staticmethod
+    def _sent_hook(
+        on_sent: Callable[[str], Any] | None, bot: str
+    ) -> Callable[[], Any] | None:
+        """Bind ``bot`` into the caller's ``on_sent(bot)`` callback."""
+        if on_sent is None:
+            return None
+        return lambda: on_sent(bot)
 
     def _make_link(self, bot: str, url: str) -> dict[str, str]:
         provider = provider_for_url(url, self.extra_url_pattern)
@@ -661,6 +714,7 @@ class MultiVideoBotUploader:
         should_cancel: Callable[[], bool] | None,
         on_attempt: Callable[[str, int, int], Any] | None,
         on_link: Callable[[dict[str, str]], Any] | None,
+        on_sent: Callable[[str], Any] | None = None,
     ) -> dict[str, Any]:
         """Upload ``path`` to EVERY bot, sequentially; keep every link."""
         attempts: list[dict[str, str]] = []
@@ -679,7 +733,10 @@ class MultiVideoBotUploader:
 
             try:
                 result = await uploader.upload(
-                    path, client=client, should_cancel=should_cancel
+                    path,
+                    client=client,
+                    should_cancel=should_cancel,
+                    on_sent=self._sent_hook(on_sent, bot),
                 )
             except (UploadCancelled, VideoTooLargeError):
                 raise
@@ -732,6 +789,7 @@ class MultiVideoBotUploader:
         should_cancel: Callable[[], bool] | None,
         on_attempt: Callable[[str, int, int], Any] | None,
         on_link: Callable[[dict[str, str]], Any] | None = None,
+        on_sent: Callable[[str], Any] | None = None,
     ) -> dict[str, Any]:
         attempts: list[dict[str, str]] = []
         last_exc: UploadError | None = None
@@ -753,7 +811,10 @@ class MultiVideoBotUploader:
 
             try:
                 result = await uploader.upload(
-                    path, client=client, should_cancel=should_cancel
+                    path,
+                    client=client,
+                    should_cancel=should_cancel,
+                    on_sent=self._sent_hook(on_sent, bot),
                 )
             except (UploadCancelled, VideoTooLargeError):
                 raise
