@@ -336,14 +336,24 @@ class Settings:
     video_bot_fallback_on_timeout: bool = False
     # Accept only bot messages that are Telegram replies to the sent video.
     video_bot_require_reply: bool = True
-    # Per-video wait for the bot's link AFTER the file was delivered to it.
+    # LEGACY (VIDEO_BOT_TIMEOUT_SECONDS): still parsed, but no longer controls the
+    # wait for a link - ``video_link_timeout_seconds`` does.
     video_bot_timeout_seconds: int = 1800
+    # Per-video wait for the bot's link AFTER the file was delivered to it
+    # (VIDEO_LINK_TIMEOUT, default 900 s = 15 minutes). Videos are sent one at a
+    # time: the next video starts as soon as the link arrives, or - at the
+    # latest - once this timeout has elapsed (the video is then marked failed).
+    video_link_timeout_seconds: int = 900
     # Attempts to *deliver* one video to the bot. A video is never re-sent
     # once the bot has received it (timeouts are not retried).
     video_bot_send_attempts: int = 2
     video_url_pattern: Optional[str] = None
-    # Safety limit for EACH individual video (not for the ZIP archive).
+    # Safety limit for EACH individual video (not for the ZIP archive). With
+    # ``merge_videos`` it also applies to the merged video.
     video_max_size_gb: float = 1.5
+    # MERGE_VIDEOS: when true and a ZIP holds 2+ videos they are merged into ONE
+    # video (FFmpeg stream copy, never re-encoded) before the video bots.
+    merge_videos: bool = False
 
     # Optional custom final Telegram post (FINAL_POST_TEMPLATE). Empty/None
     # keeps the built-in clean final post. May contain escaped ``\\n``.
@@ -442,8 +452,9 @@ class Settings:
             f"telegraph_access_token='***redacted***', "
             f"video_bots={list(self.video_bots)!r}, "
             f"video_bot_mode={self.video_bot_mode!r}, "
-            f"video_bot_timeout_seconds={self.video_bot_timeout_seconds}, "
-            f"video_max_size_gb={self.video_max_size_gb}"
+            f"video_link_timeout_seconds={self.video_link_timeout_seconds}, "
+            f"video_max_size_gb={self.video_max_size_gb}, "
+            f"merge_videos={self.merge_videos}"
             f")"
         )
 
@@ -683,6 +694,12 @@ class Settings:
                 minimum=10,
                 maximum=7200,
             ) or 1800,
+            video_link_timeout_seconds=_get_int(
+                "VIDEO_LINK_TIMEOUT",
+                default=900,
+                minimum=10,
+                maximum=7200,
+            ) or 900,
             video_bot_send_attempts=_get_int(
                 "VIDEO_BOT_SEND_ATTEMPTS",
                 default=2,
@@ -698,6 +715,10 @@ class Settings:
             video_url_pattern=_get_str(
                 "VIDEO_URL_PATTERN",
                 default=None,
+            ),
+            merge_videos=_get_bool(
+                "MERGE_VIDEOS",
+                default=False,
             ),
             final_post_template=_get_str(
                 "FINAL_POST_TEMPLATE",
