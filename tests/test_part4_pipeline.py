@@ -218,13 +218,17 @@ async def test_mixed_zip_end_to_end_with_one_final_message(settings, tmp_path, n
     assert status.replies == []
     assert all(kw.get("link_preview") is False for kw in status.edit_kwargs)
     final = status.edits[-1]
-    # Clean final post: Telegraph first, then DiskWala links only (b.mp4 has none).
-    assert final == (
+    # Clean final post: Telegraph first, then DiskWala links only (b.mp4 has none) ...
+    clean = (
         "📝 Telegraph\nhttps://telegra.ph/album\n\n"
         "🎬 Videos\n\n"
         "https://www.diskwala.com/app/DW-a\n\n"
         "https://www.diskwala.com/app/DW-d"
     )
+    assert final.startswith(clean + "\n\n🎬 Videos:\n")
+    # ... followed by the per-video report: the failed video with its reason + a summary.
+    assert "big.mp4 → ❌" in final and "exceeds the size limit" in final
+    assert "Video links received: 3" in final and "Failed videos: 1" in final
     assert len(final) <= 4096
 
     # Temporary handlers were all removed; job files cleaned.
@@ -320,7 +324,10 @@ async def test_failed_video_continues_with_next_video_and_is_reported(settings, 
     }
     final = job._status_message.edits[-1]
     assert "https://www.diskwala.com/app/DW-v1" in final
-    assert "v2.mp4" not in final and "did not reply" not in final  # no failure details
+    # The failed video is listed with a short reason (not the raw uploader text).
+    assert "2/3 v2.mp4 → ❌ Link not received (timeout)" in final and "did not reply" not in final
+    assert "1/3 v1.mp4 → ✅ URL received" in final
+    assert "Video links received: 2" in final and "Failed videos: 1" in final
     assert client.active_handlers() == 0
 
 
@@ -373,8 +380,9 @@ async def test_over_1_5_gb_video_is_rejected_with_reason_and_next_video_continue
     assert [f["filename"] for f in job.metadata["video_failures"]] == ["huge.mp4"]
     assert [r["filename"] for r in job.metadata["video_results"]] == ["ok.mp4"]
     final = job._status_message.edits[-1]
-    assert "huge.mp4" not in final and "exceeds" not in final
+    assert "1/2 huge.mp4 → ❌ Video exceeds the size limit" in final
     assert "https://www.diskwala.com/app/DW-ok" in final
+    assert "Videos: 2" in final and "Video links received: 1" in final
 
 
 # --------------------------------------------------------------------------- #
@@ -749,8 +757,9 @@ async def test_video_fails_only_when_every_bot_failed_and_next_video_continues(s
     assert [f["filename"] for f in job.metadata["video_failures"]] == ["bad.mp4"]
     assert {r["filename"] for r in job.metadata["video_results"]} == {"good.mp4"}
     final = job._status_message.edits[-1]
-    assert final == "🎬 Videos\n\nhttps://www.diskwala.com/app/DW-good"
-    assert "bad" not in final
+    assert final.startswith("🎬 Videos\n\nhttps://www.diskwala.com/app/DW-good\n\n🎬 Videos:\n")
+    assert "1/2 bad.mp4 → ❌" in final and "2/2 good.mp4 → ✅ URL received" in final
+    assert "Videos: 2" in final and "Video links received: 1" in final and "Failed videos: 1" in final
 
 
 @pytest.mark.asyncio
