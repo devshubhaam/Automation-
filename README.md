@@ -84,8 +84,36 @@ process the file. A **timeout is not followed by another bot** by default, becau
 bot may still be processing the video (set `VIDEO_BOT_FALLBACK_ON_TIMEOUT=true` to change
 this). If every bot fails, the video is reported as failed with every bot's reason.
 
+**Sequential link workflow.** Videos are processed strictly one at a time: send video → wait
+for the bot's reply **to that exact video** (Telegram reply-to; replies to other videos, random
+chatter and links of other videos are ignored) → the moment the URL arrives the next video is
+sent. The wait per video is `VIDEO_LINK_TIMEOUT` (default **900 s = 15 minutes**, counted from
+the moment the file was delivered). Only after the full timeout is that video marked failed
+(`Link not received (timeout)`); the remaining videos are still processed. Every step is
+logged (sending, waiting for reply, URL received, timeout, moving to next video).
+
+**Final status.** All links received → `COMPLETED`. Some videos without a link →
+`COMPLETED_WITH_ERRORS` (the job is **not** failed). The final post then keeps the Telegraph
+article and the received links exactly as configured and appends the per-video result and a summary:
+
+```
+🎬 Videos:
+1/10 video1.mp4 → ✅ URL received
+...
+10/10 video10.mp4 → ❌ Link not received (timeout)
+
+📊 Summary:
+Images: X
+Videos: 10
+Video links received: 9
+Failed videos: 1
+```
+
+With 10/10 links nothing is appended. Very long lists shrink (failed videos first, then the
+summary only) so the post always fits into one Telegram message.
+
 **Flezen is slow.** The first reply `Downloading the file, please wait...` is **not** a
-result. For the whole `VIDEO_BOT_TIMEOUT_SECONDS` (default 1800 s) the bot's *new and edited*
+result. For the whole `VIDEO_LINK_TIMEOUT` (default 900 s) the bot's *new and edited*
 messages are watched until the final `https://flezen.com/s/...` link appears — as an edit of
 that reply or as a new reply to it. If it never appears, the video fails with a timeout.
 
@@ -116,8 +144,8 @@ runs; successful results are kept.
 | `part2_skipped_large_images` | Images > 2 MiB that were skipped |
 | `imgbb_results` | `[{filename, relative_path, url}]` for successful ImgBB uploads |
 | `telegraph_articles` | Article URL(s), only if images were uploaded |
-| `video_processing` | `"video_bot"` or `"not_required"` |
-| `video_status` | Per video: `{filename, relative_path, status, url, error}` (`pending`, `processing`, `done`, `failed`, `cancelled`) |
+| `video_processing` | `"video_bot"`, `"not_required"` |
+| `video_status` | Per video: `{filename, relative_path, status, url, error}` (`pending`, `processing`, `waiting_link`, `done`, `failed`, `cancelled`) |
 | `video_results` | `[{filename, relative_path, url}]` — the filename → URL mapping |
 | `video_failures` | `[{filename, relative_path, error}]` |
 
@@ -185,7 +213,8 @@ Copy `.env.example` to `.env`. Required: `API_ID`, `API_HASH` (plus `BOT_TOKEN`/
 | `TELEGRAPH_ACCESS_TOKEN` | *(anonymous account per start)* | Telegraph account token |
 | `TELEGRAPH_AUTHOR_NAME` | — | Author shown on the article |
 | `VIDEO_BOTS` | — | Comma-separated bots, tried in order: `@DiskWalaFileUploaderBot,@FlezenUploadBot`. Without it every video fails with a clear error. (`VIDEO_BOT_USERNAME` is the deprecated single-bot form) |
-| `VIDEO_BOT_TIMEOUT_SECONDS` | `1800` | Per-video wait for the final link after delivery (10–7200) |
+| `VIDEO_LINK_TIMEOUT` | `900` | Per-video wait for the final link after delivery, in seconds (10–7200). The next video starts as soon as the link arrives; a video without a link after this time is failed |
+| `VIDEO_BOT_TIMEOUT_SECONDS` | `1800` | **Legacy**, still parsed but no longer controls the wait (use `VIDEO_LINK_TIMEOUT`) |
 | `VIDEO_BOT_SEND_ATTEMPTS` | `2` | Delivery attempts per video (1–5) |
 | `VIDEO_MAX_SIZE_GB` | `1.5` | Per-video size limit |
 | `VIDEO_BOT_FALLBACK_ON_TIMEOUT` | `false` | Try the next bot after a timeout (may duplicate an upload) |
@@ -237,3 +266,4 @@ failed video and a Telegraph failure not stopping the rest, the 1.5 GB limit, vi
 reaching ImgBB/Telegraph, the 4096-character final message, shutdown/cancellation and the
 `.env.example` values.
 `scripts/smoke_startup.py` is a startup/config smoke test.
+
