@@ -342,7 +342,16 @@ class ProgressRenderer:
                     text += f" · ⚠️ {len(partial)} bot failed"
 
             elif status == "failed":
-                text = f"❌ {self._escape(str(entry.get('error') or 'failed')[:120])}"
+                reason = self._video_failure_reason(entry.get("error"))
+                text = f"❌ {self._escape(reason[:120])}"
+
+            elif status == "waiting_link":
+                text = "⏳ Waiting for link"
+
+                if bot:
+                    text += f" · @{self._escape(bot)}"
+                if links:
+                    text += f" · {len(links)} link(s) ready"
 
             elif status == "processing":
                 text = "⏳ Processing (video bot)"
@@ -352,14 +361,104 @@ class ProgressRenderer:
                 if links:
                     text += f" · {len(links)} link(s) ready"
 
+            elif status == "merging":
+                text = "🔀 Merging videos (no re-encoding)"
+
             elif status == "cancelled":
                 text = "🛑 Cancelled"
             else:
-                text = "🕓 Waiting"
+                text = "🕓 Queued"
 
             entries.append(f"{index}/{total} {name} → {text}")
 
         return ["", "🎬 <b>Videos (video bot):</b>"] + self._limit_lines(entries)
+
+    @staticmethod
+    def _video_failure_reason(error: Any) -> str:
+        """Short, user-facing reason of a failed video.
+
+        The uploader's timeout message (``Video bot did not reply with a link
+        within 900s``) becomes ``Link not received (timeout)``.
+        """
+
+        text = " ".join(str(error or "").split())
+        lowered = text.lower()
+        if not text:
+            return "Link not received"
+        if "did not reply with a link" in lowered:
+            return "Link not received (timeout)"
+        return text
+
+    def _video_report(self, job: Job, results: list[Any], max_chars: int = 1500) -> str | None:
+        """Per-video list + summary for a job whose videos did not all get a link.
+
+            🎬 Videos:
+            1/10 video1.mp4 → ✅ URL received
+            10/10 video10.mp4 → ❌ Link not received (timeout)
+
+            📊 Summary:
+            Images: X
+            Videos: 10
+            Video links received: 9
+            Failed videos: 1
+
+        ``None`` when every video got its link (or there is no per-video
+        status): the clean final post stays exactly as before then. Long lists
+        shrink step by step: all videos -> only the failed ones -> summary only.
+        """
+
+        metadata = getattr(job, "metadata", None) or {}
+        statuses = list(metadata.get("video_status") or [])
+        if not statuses:
+            return None
+
+        total = len(statuses)
+        failed_idx = [i for i, e in enumerate(statuses) if e.get("status") != "done"]
+        if not failed_idx:
+            return None
+        received = total - len(failed_idx)
+
+        images = self._count_successful_images(
+            [r for r in results if self._provider_of(r) == "imgbb"]
+        )
+        summary = [
+            "📊 Summary:",
+            f"Images: {images}",
+            f"Videos: {total}",
+            f"Video links received: {received}",
+            f"Failed videos: {len(failed_idx)}",
+        ]
+
+        def line(i: int) -> str:
+            entry = statuses[i]
+            name = self._short(entry.get("filename") or "video", self.MAX_NAME_CHARS)
+            if entry.get("status") == "done":
+                state = "✅ URL received"
+            else:
+                reason = self._video_failure_reason(entry.get("error"))
+                state = f"❌ {self._short(reason, self.MAX_REASON_CHARS)}"
+            return f"{i + 1}/{total} {name} → {state}"
+
+        def build(indexes: list[int], hidden_ok: int) -> str:
+            lines: list[str] = []
+            if indexes:
+                lines.append("🎬 Videos:")
+                lines.extend(line(i) for i in indexes)
+                if hidden_ok:
+                    lines.append(f"… and {hidden_ok} more video(s) with a URL received")
+                lines.append("")
+            lines.extend(summary)
+            return "\n".join(lines)
+
+        for indexes, hidden in (
+            (list(range(total)), 0),
+            (failed_idx, received),
+            (failed_idx[:5], received),
+        ):
+            text = build(indexes, hidden)
+            if len(text) <= max_chars:
+                return text
+        return build([], 0)
 
     @staticmethod
     def _provider_label(provider: Any) -> str:
@@ -463,17 +562,27 @@ class ProgressRenderer:
         if not telegraph_url and not video_urls:
             return None
 
-        if self.final_post_template:
-            custom = self._render_custom_final(
-                job, results, telegraph_url, video_urls
-            )
-            if custom is not None:
-                return custom
+        # Some videos got no link: the post additionally lists them (name +
+        # reason) and a summary. Without failed videos nothing is added.
+        report = (
+            self._video_report(job, results)
+            if job.status == JobStatus.COMPLETED_WITH_ERRORS
+            else None
+        )
+        limit = self.MAX_MESSAGE_CHARS - (len(report) + 2 if report else 0)
 
-        return self._build_default_clean(telegraph_url, video_urls)
+        text: str | None = None
+        if self.final_post_template:
+            text = self._render_custom_final(
+                job, results, telegraph_url, video_urls, limit=limit
+            )
+        if text is None:
+            text = self._build_default_clean(telegraph_url, video_urls, limit=limit)
+
+        return f"{text}\n\n{report}" if report else text
 
     def _build_default_clean(
-        self, telegraph_url: str, video_urls: list[str]
+        self, telegraph_url: str, video_urls: list[str], limit: int | None = None
     ) -> str:
         """The built-in clean final post (used when no template is set)."""
 
@@ -493,9 +602,10 @@ class ProgressRenderer:
                     lines.extend(["", f"… +{len(video_urls) - count} more"])
             return "\n".join(lines)
 
+        limit = self.MAX_MESSAGE_CHARS if limit is None else limit
         count = len(video_urls)
         text = build(count)
-        while count > 0 and len(text) > self.MAX_MESSAGE_CHARS:
+        while count > 0 and len(text) > limit:
             count -= 1
             text = build(count)
         return text
@@ -506,6 +616,7 @@ class ProgressRenderer:
         results: list[Any],
         telegraph_url: str,
         video_urls: list[str],
+        limit: int | None = None,
     ) -> str | None:
         """Render ``FINAL_POST_TEMPLATE``; ``None`` -> use the default post.
 
@@ -563,10 +674,11 @@ class ProgressRenderer:
             values["video_count"] = str(count)
             return template.format_map(values)
 
+        limit = self.MAX_MESSAGE_CHARS if limit is None else limit
         try:
             count = len(video_urls)
             text = build(count)
-            while count > 0 and len(text) > self.MAX_MESSAGE_CHARS:
+            while count > 0 and len(text) > limit:
                 count -= 1
                 text = build(count)
         except (KeyError, IndexError, ValueError, AttributeError) as exc:
@@ -577,11 +689,11 @@ class ProgressRenderer:
             )
             return None
 
-        if len(text) > self.MAX_MESSAGE_CHARS:
+        if len(text) > limit:
             logger.warning(
                 "FINAL_POST_TEMPLATE is longer than %d characters even without "
                 "video links; using the default final post.",
-                self.MAX_MESSAGE_CHARS,
+                limit,
             )
             return None
 
