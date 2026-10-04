@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import signal
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from .logging_config import setup_logging
 from .login_bot import LoginBot
 from .media_scanner import scan_directory
 from .progress import ProgressRenderer
+from .media_scanner import MediaFile
 from .telegram_client import TelegramUserbot
 from .uploaders import (
     PART2_IMAGE_MAX_BYTES,
@@ -33,8 +35,15 @@ from .uploaders import (
     UploadCancelled,
     UploadError,
     MultiVideoBotUploader,
+    VideoTimeoutError,
     VideoTooLargeError,
     video_too_large_message,
+)
+from .video_merge import (
+    MergeCancelledError,
+    VideoMergeError,
+    VideoMerger,
+    sanitize_stem,
 )
 
 logger = logging.getLogger("app.main")
@@ -108,6 +117,7 @@ class PipelineWorker:
         imgbb_uploader: Any = None,
         telegraph_publisher: Any = None,
         video_uploader: Any = None,
+        video_merger: Any = None,
     ) -> None:
         self.settings = settings
         self.job_manager = job_manager
@@ -145,7 +155,7 @@ class PipelineWorker:
                 if self.telegram_client_provider
                 else None
             ),
-            timeout_seconds=settings.video_bot_timeout_seconds,
+            timeout_seconds=settings.video_link_timeout_seconds,
             extra_url_pattern=settings.video_url_pattern,
             max_size_bytes=settings.video_max_size_bytes,
             send_attempts=settings.video_bot_send_attempts,
@@ -153,6 +163,11 @@ class PipelineWorker:
             mode=settings.video_bot_mode,
             require_reply=settings.video_bot_require_reply,
         )
+
+        # MERGE_VIDEOS: merge of 2+ videos into one file before the video bots -
+        # lossless stream copy when the videos are compatible, automatic
+        # normalised re-encode otherwise. Unused when the feature is disabled.
+        self.video_merger = video_merger or VideoMerger()
 
     # ------------------------------------------------------------------
     # QUEUE
@@ -191,6 +206,16 @@ class PipelineWorker:
             return
 
         self._stopping = False
+
+        if getattr(self.settings, "merge_videos", False):
+            missing = [t for t in ("ffmpeg", "ffprobe") if shutil.which(t) is None]
+            if missing:
+                # Never fatal: jobs with 2+ videos will report a failed merge.
+                logger.error(
+                    "MERGE_VIDEOS=true but %s not found on PATH; ZIPs with several "
+                    "videos will fail to merge until it is installed",
+                    " and ".join(missing),
+                )
 
         worker_count = max(
             1,
@@ -680,7 +705,15 @@ class PipelineWorker:
         job: Job,
         videos: list[Any],
     ) -> list[dict[str, Any]]:
-        """Send each video to the video bots, one at a time, independently.
+        """Send each video to the video bots, STRICTLY one at a time.
+
+        Per video: send -> wait for the reply to exactly that video (up to
+        ``VIDEO_LINK_TIMEOUT``, 900 s by default) -> as soon as the URL arrives
+        the next video starts. Only after the full timeout is a video marked
+        failed ("Link not received"). Every video ends as ``done`` or
+        ``failed`` before the job can be completed: the job is
+        COMPLETED only when every video got its link, otherwise
+        COMPLETED_WITH_ERRORS (the final post then lists the failed videos).
 
         Every video keeps its own status/result entry keyed by its filename
         (and relative path), so one failure or timeout never affects another
@@ -695,6 +728,18 @@ class PipelineWorker:
         if not videos:
             self.job_manager.set_metadata(job.job_id, "video_processing", "not_required")
             return []
+
+        # MERGE_VIDEOS=true and 2+ videos: ONE merged video replaces the
+        # individual videos, which are then never sent to any bot. A single
+        # video is never merged (the original is sent as before).
+        merged_from = 0
+        if getattr(self.settings, "merge_videos", False) and len(videos) >= 2:
+            merged = await self._merge_source_videos(job, videos)
+            if merged is None:  # failure already recorded; nothing is uploaded
+                await self._notify(job)
+                return []
+            merged_from = len(videos)
+            videos = [merged]
 
         statuses: list[dict[str, Any]] = [
             {
@@ -733,7 +778,10 @@ class PipelineWorker:
         client = self._telegram_client(job)
         limit = self.settings.video_max_size_bytes
 
-        for media, entry in zip(videos, statuses):
+        total_videos = len(videos)
+        link_timeout = int(getattr(self.settings, "video_link_timeout_seconds", 900))
+
+        for position, (media, entry) in enumerate(zip(videos, statuses), start=1):
             self._checkpoint(job)  # between videos
 
             video_path = Path(media.path)
@@ -742,10 +790,19 @@ class PipelineWorker:
                 "path": str(video_path),
                 "relative_path": entry["relative_path"],
             }
+            if merged_from:
+                extra["merged_from"] = merged_from
 
             entry["status"] = "processing"
             publish_metadata()
             await self._notify(job)
+
+            async def on_sent(bot: str, entry: dict[str, Any] = entry) -> None:
+                """The bot has the file: now waiting for the reply with the URL."""
+                entry["status"] = "waiting_link"
+                entry["bot"] = bot
+                publish_metadata()
+                await self._notify(job)
 
             async def on_attempt(
                 bot: str,
@@ -765,7 +822,10 @@ class PipelineWorker:
                     # Never sent to any uploader bot.
                     raise VideoTooLargeError(video_too_large_message(size, limit))
 
-                logger.info("Job %s: sending video to video bot(s): %s", job.job_id, filename)
+                logger.info(
+                    "Job %s: sending video %d/%d to video bot(s): %s",
+                    job.job_id, position, total_videos, filename,
+                )
 
                 recorded: set[tuple[str, str]] = set()
 
@@ -824,6 +884,8 @@ class PipelineWorker:
                     upload_kwargs["on_attempt"] = on_attempt
                 if getattr(self.video_uploader, "supports_link_callback", False):
                     upload_kwargs["on_link"] = record_link
+                if getattr(self.video_uploader, "supports_sent_callback", False):
+                    upload_kwargs["on_sent"] = on_sent
 
                 response = await self.video_uploader.upload(video_path, **upload_kwargs)
 
@@ -844,6 +906,10 @@ class PipelineWorker:
                     raise UploadError("Video bot returned no link")
 
                 entry.update(status="done", error=None)
+                logger.info(
+                    "Job %s: URL received for video %d/%d %s (%d link(s))",
+                    job.job_id, position, total_videos, filename, len(entry["links"]),
+                )
 
                 # Some bots failed while others gave a link: report them, keep
                 # the video as successful.
@@ -864,8 +930,18 @@ class PipelineWorker:
                 publish_metadata()
                 raise
 
+            except VideoTimeoutError as exc:
+                logger.warning(
+                    "Job %s: timeout - no URL for video %d/%d %s within %ds",
+                    job.job_id, position, total_videos, filename, link_timeout,
+                )
+                self._fail_video(job, entry, failures, str(exc), extra, exc)
+
             except UploadError as exc:
-                logger.warning("Job %s: video bot failed for %s: %s", job.job_id, filename, exc)
+                logger.warning(
+                    "Job %s: video %d/%d %s failed: %s",
+                    job.job_id, position, total_videos, filename, exc,
+                )
                 self._fail_video(job, entry, failures, str(exc), extra, exc)
 
             except Exception as exc:
@@ -875,7 +951,216 @@ class PipelineWorker:
             publish_metadata()
             await self._notify(job)
 
+            if position < total_videos:
+                logger.info(
+                    "Job %s: video %d/%d finished (%s); moving to next video %d/%d",
+                    job.job_id, position, total_videos, entry["status"],
+                    position + 1, total_videos,
+                )
+
+        # Safety net: a video must never stay "pending"/"processing"/"waiting"
+        # while the job is completed - that would hide a missing link.
+        for entry in statuses:
+            if entry["status"] not in ("done", "failed"):
+                logger.warning(
+                    "Job %s: video %s ended in state %r without a link; marking it failed",
+                    job.job_id, entry["filename"], entry["status"],
+                )
+                self._fail_video(
+                    job,
+                    entry,
+                    failures,
+                    "Link not received",
+                    {"path": "", "relative_path": entry["relative_path"]},
+                )
+
+        links_received = sum(1 for e in statuses if e["status"] == "done")
+        self.job_manager.set_metadata(
+            job.job_id,
+            "video_summary",
+            {
+                "total": total_videos,
+                "links_received": links_received,
+                "failed": total_videos - links_received,
+            },
+        )
+        logger.info(
+            "Job %s: video links received for %d/%d videos",
+            job.job_id, links_received, total_videos,
+        )
+        publish_metadata()
+
         return results
+
+    async def _merge_source_videos(
+        self,
+        job: Job,
+        videos: list[Any],
+    ) -> MediaFile | None:
+        """Merge ``videos`` (in their existing order) into ONE video file.
+
+        Returns the merged :class:`MediaFile`, or ``None`` after recording a
+        failed video result (FFmpeg/FFprobe missing, unreadable source,
+        FFmpeg error, merged file over ``VIDEO_MAX_SIZE_GB``). Cancellation
+        raises :class:`JobCancelled` (FFmpeg is terminated and the partial
+        output removed by the merger). Compatible sources are merged with
+        stream copy; incompatible ones are re-encoded automatically by the
+        merger. Source videos are never uploaded individually.
+        """
+
+        count = len(videos)
+        stem = sanitize_stem(Path(job.archive_name).stem, default="video") + "_merged"
+        display = f"{stem} ({count} videos)"
+        limit = self.settings.video_max_size_bytes
+        merge_info: dict[str, Any] = {
+            "status": "merging",
+            "mode": "stream_copy",  # first attempt; the merger falls back to "reencode" itself
+            "source_count": count,
+            "sources": [str(getattr(m, "relative_path", Path(m.path).name)) for m in videos],
+            "error": None,
+        }
+
+        # The merged video is the unit that is uploaded / reported.
+        self.job_manager.set_media_counts(
+            job.job_id,
+            image_count=job.image_count,
+            video_count=1,
+            ignored_count=job.ignored_count,
+        )
+        self.job_manager.update_metadata(
+            job.job_id,
+            {
+                "video_processing": "video_merge",
+                "video_merge": dict(merge_info),
+                "video_status": [
+                    {
+                        "filename": display,
+                        "relative_path": "",
+                        "status": "merging",
+                        "url": None,
+                        "error": None,
+                        "bot": None,
+                        "provider": None,
+                        "links": [],
+                        "partial_errors": [],
+                    }
+                ],
+            },
+        )
+
+        self._checkpoint(job)  # before merging
+        await self._ensure_uploading(job)
+        await self._notify(job)
+
+        output_dir = Path(job.extract_dir or job.archive_path).parent / "merged"
+        logger.info(
+            "Job %s: merging %d videos (stream copy, automatic re-encode fallback)",
+            job.job_id,
+            count,
+        )
+
+        try:
+            result = await self.video_merger.merge(
+                [Path(m.path) for m in videos],
+                output_dir,
+                output_stem=stem,
+                max_output_bytes=limit,
+                should_cancel=lambda: job.cancel_requested,
+            )
+
+        except MergeCancelledError:
+            merge_info["status"] = "cancelled"
+            self.job_manager.update_metadata(job.job_id, {"video_merge": dict(merge_info)})
+            raise JobCancelled()
+
+        except asyncio.CancelledError:
+            merge_info["status"] = "cancelled"
+            self.job_manager.update_metadata(job.job_id, {"video_merge": dict(merge_info)})
+            raise
+
+        except VideoMergeError as exc:
+            logger.warning("Job %s: video merge failed (%s): %s", job.job_id, exc.reason, exc)
+            if getattr(exc, "mode", None):
+                merge_info["mode"] = exc.mode  # failed inside the re-encode fallback
+            message = f"Video merge failed: {exc}"
+            self._record_merge_failure(job, merge_info, stem, message, exc.reason)
+            return None
+
+        except Exception as exc:
+            logger.exception("Job %s: unexpected video merge error", job.job_id)
+            self._record_merge_failure(
+                job, merge_info, stem, f"Video merge failed: {type(exc).__name__}: {exc}", "error"
+            )
+            return None
+
+        merged = MediaFile(
+            path=result.output_path,
+            relative_path=f"merged/{result.output_path.name}",
+            filename=result.output_path.name,
+            media_type="video",
+            index=1,
+            size_bytes=result.size_bytes,
+        )
+        merge_info.update(
+            status="done",
+            mode=getattr(result, "mode", "stream_copy"),
+            output=merged.filename,
+            size_bytes=result.size_bytes,
+            container=result.container,
+            error=None,
+            fallback_reason=getattr(result, "reencode_reason", None),
+        )
+        self.job_manager.update_metadata(job.job_id, {"video_merge": dict(merge_info)})
+        logger.info(
+            "Job %s: merged %d videos into %s (%d bytes, %s)",
+            job.job_id,
+            count,
+            merged.filename,
+            result.size_bytes,
+            merge_info["mode"],
+        )
+        return merged
+
+    def _record_merge_failure(
+        self,
+        job: Job,
+        merge_info: dict[str, Any],
+        name: str,
+        error: str,
+        reason: str,
+    ) -> None:
+        """One failed video result for the whole merge (no individual uploads)."""
+        merge_info.update(status="failed", error=error, reason=reason)
+        entry: dict[str, Any] = {
+            "filename": name,
+            "relative_path": "",
+            "status": "failed",
+            "url": None,
+            "error": error,
+            "bot": None,
+            "provider": None,
+            "links": [],
+            "partial_errors": [],
+        }
+        failures: list[dict[str, Any]] = []
+        self._fail_video(
+            job,
+            entry,
+            failures,
+            error,
+            {"path": "", "relative_path": "", "merge_failed": True, "merge_reason": reason},
+        )
+        self.job_manager.update_metadata(
+            job.job_id,
+            {
+                "video_processing": "video_merge",
+                "video_merge": dict(merge_info),
+                "video_files": [],
+                "video_status": [entry],
+                "video_results": [],
+                "video_failures": failures,
+            },
+        )
 
     @staticmethod
     def _video_size(path: Path) -> int:
