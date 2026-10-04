@@ -311,8 +311,13 @@ class VideoBotUploader:
         retry_delay_seconds: float = 5.0,
         require_reply: bool = False,
         detect_rejection: bool = False,
+        history_poll_seconds: float = 10.0,
     ) -> None:
         self.bot_username = normalise_username(bot_username)
+        # How often the bot chat history is re-read while waiting (0 = never).
+        # Safety net for Telegram updates (new messages OR edits) that the live
+        # event handlers never received. Same reply-to matching as the events.
+        self.history_poll_seconds = max(0.0, float(history_poll_seconds))
         self.client_provider = client_provider
         self.timeout_seconds = float(timeout_seconds)
         self.poll_seconds = float(poll_seconds)
@@ -379,7 +384,15 @@ class VideoBotUploader:
         future: asyncio.Future[str] = loop.create_future()
         state: dict[str, Any] = {"sent_id": None, "early": [], "adopted": set()}
 
-        def consider(message: Any) -> None:
+        def consider(message: Any, source: str = "event") -> None:
+            """Accept ``message`` only if it is the bot's reply to THIS video.
+
+            Match rule: ``message.reply_to_msg_id == sent message id`` (or a
+            reply to a bot message that itself replied to our video - the bot
+            may answer its own "processing" message - or an edit of such a
+            message). Every bot message seen while waiting is logged with the
+            decision, so a missing link can be diagnosed from the log alone.
+            """
             if future.done():
                 return
             sent_id = state["sent_id"]
@@ -398,12 +411,18 @@ class VideoBotUploader:
                 reply_to == sent_id or reply_to in adopted
             )
 
+            def ignore(reason: str) -> None:
+                logger.info(
+                    "Ignored bot message id=%s reply_to=%s for %s (sent id=%s, %s): %s",
+                    msg_id, reply_to, path.name, sent_id, source, reason,
+                )
+
             if isinstance(reply_to, int) and not replies_to_current and not known:
-                return  # explicitly a reply to some other (earlier) video
+                return ignore("reply to a different message")
             if self.require_reply and not replies_to_current and not known:
-                return  # strict mode: only replies to THIS video count
+                return ignore("not a reply to the sent video")
             if isinstance(msg_id, int) and msg_id <= sent_id and not known:
-                return  # an older message, not a reply to this video
+                return ignore("older than the sent video")
 
             if replies_to_current and isinstance(msg_id, int):
                 # Remember it: the bot may EDIT this message later.
@@ -412,19 +431,58 @@ class VideoBotUploader:
             url = extract_url(message, self._pattern)
             if url:
                 logger.info(
-                    "URL received for %s from @%s (reply to message %s): %s",
-                    path.name, self.bot_username, reply_to if replies_to_current else msg_id, url,
+                    "URL received for %s from @%s: message id=%s reply_to=%s matches "
+                    "sent id=%s (%s): %s",
+                    path.name, self.bot_username, msg_id, reply_to, sent_id, source, url,
                 )
                 future.set_result(url)
                 return
 
+            logger.info(
+                "Bot message id=%s reply_to=%s is a reply to %s (sent id=%s, %s) "
+                "but has no link yet; still waiting",
+                msg_id, reply_to, path.name, sent_id, source,
+            )
             if self.detect_rejection and (replies_to_current or known):
                 if _REJECTION_RE.search(_message_text(message)):
+                    logger.warning(
+                        "@%s rejected %s (message id=%s)", self.bot_username, path.name, msg_id
+                    )
                     future.set_exception(
                         VideoBotRejectedError(
                             f"@{self.bot_username} could not process the video"
                         )
                     )
+
+        async def poll_history() -> None:
+            """Re-read the bot chat and run the SAME reply-to matching on it.
+
+            Catches replies/edits whose live update never arrived. Messages are
+            handled oldest first so reply chains (bot replies to its own
+            placeholder) are followed correctly.
+            """
+            sent_id = state["sent_id"]
+            if not sent_id or not callable(getattr(client, "get_messages", None)):
+                return
+            try:
+                messages = await client.get_messages(
+                    self.bot_username, min_id=sent_id, limit=50
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("History check for @%s failed: %s", self.bot_username, exc)
+                return
+            if not isinstance(messages, (list, tuple)):
+                messages = [messages] if messages else []
+            ordered = sorted(
+                (m for m in messages if getattr(m, "out", False) is not True),
+                key=lambda m: getattr(m, "id", 0) or 0,
+            )
+            for message in ordered:
+                if future.done():
+                    return
+                consider(message, "history check")
 
         async def on_event(event: Any) -> None:
             consider(getattr(event, "message", event))
@@ -436,9 +494,22 @@ class VideoBotUploader:
         try:
             sent = await self._send_with_retry(client, path, should_cancel, state)
 
+            if isinstance(sent, (list, tuple)):  # defensive: some APIs return a list
+                sent = sent[0] if sent else None
             state["sent_id"] = getattr(sent, "id", 0) or 0
+            if not state["sent_id"]:
+                logger.warning(
+                    "Could not read the id of the message sent to @%s for %s; "
+                    "replies cannot be matched to it",
+                    self.bot_username, path.name,
+                )
+            else:
+                logger.info(
+                    "Sent %s to @%s as message id=%s; replies are matched by reply_to_msg_id",
+                    path.name, self.bot_username, state["sent_id"],
+                )
             for message in state["early"]:
-                consider(message)
+                consider(message, "early event")
 
             # The bot has the file now: never re-send it, only wait.
             logger.info(
@@ -453,10 +524,26 @@ class VideoBotUploader:
                 except Exception:
                     logger.debug("on_sent callback failed", exc_info=True)
 
-            deadline = loop.time() + self.timeout_seconds
+            started = loop.time()
+            deadline = started + self.timeout_seconds
+            next_poll = started + self.history_poll_seconds if self.history_poll_seconds else None
+            next_report = started + 60.0
             while not future.done():
                 if should_cancel and should_cancel():
                     raise UploadCancelled()
+                now = loop.time()
+                if next_poll is not None and now >= next_poll:
+                    await poll_history()
+                    next_poll = loop.time() + self.history_poll_seconds
+                    if future.done():
+                        break
+                if now >= next_report:
+                    logger.info(
+                        "Still waiting for @%s's reply to %s (message id=%s, %ds of %ds)",
+                        self.bot_username, path.name, state["sent_id"],
+                        int(now - started), int(self.timeout_seconds),
+                    )
+                    next_report = now + 60.0
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     logger.warning(
@@ -576,6 +663,7 @@ class MultiVideoBotUploader:
         fallback_on_timeout: bool = False,
         require_reply: bool = True,
         mode: str = "all",
+        history_poll_seconds: float = 10.0,
     ) -> None:
         mode = str(mode or "all").strip().lower()
         if mode not in ("all", "fallback"):
@@ -610,6 +698,7 @@ class MultiVideoBotUploader:
                 retry_delay_seconds=retry_delay_seconds,
                 require_reply=require_reply,
                 detect_rejection=True,
+                history_poll_seconds=history_poll_seconds,
             )
             for name in names
         ]
